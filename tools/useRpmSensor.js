@@ -16,6 +16,8 @@ import {
   createSmoother,
   autoCorrectGain,
   detectRelease,
+  relockStep,
+  STOPPED_RAD_S,
   closestStandard,
   ZERO_DEADBAND_RAD_S,
   CALIBRATION_TIMINGS,
@@ -24,7 +26,16 @@ import { createSpeedSender } from './speedSender';
 
 const { BIAS_CALIBRATION_MS, AXIS_CALIBRATION_MS } = CALIBRATION_TIMINGS;
 
-const SENSOR_UPDATE_INTERVAL_MS = 30;
+// --- Optimisation batterie ---
+// Le gyro tourne à 20 Hz (50 ms) au lieu de 33 Hz : amplement suffisant
+// pour le DVS (le lissage fait le reste) et ~40% d'énergie capteur en moins.
+// L'accéléromètre ne sert qu'au rejet de choc -> encore moins sollicité.
+const SENSOR_UPDATE_INTERVAL_MS = 50;
+const ACCEL_UPDATE_INTERVAL_MS = 100;
+// Le state React (re-render de l'UI) n'a besoin que de ~12,5 fps pour un
+// affichage de chiffres : on met à jour rpmRef (lu par le sender) à chaque
+// échantillon, mais setRpm (qui déclenche le rendu) est limité à ce rythme.
+const UI_UPDATE_INTERVAL_MS = 80;
 
 // Rejet de choc/vibration : échantillon ignoré si l'accélération s'écarte
 // trop de 1g (impact de la main, wobble du plateau...)
@@ -45,7 +56,7 @@ const STOP_DETECTION_CONSECUTIVE = 2;
 // à l'arrêt) pendant ~2 s, on réestime le biais et on le mélange doucement au
 // biais actuel (compense la dérive du gyro avec la chaleur/temps).
 const BIAS_REESTIMATE_RAW_MAG_MAX = 0.35; // rad/s : en dessous = immobile
-const BIAS_REESTIMATE_SAMPLES = 70;        // ~2 s à 30 ms
+const BIAS_REESTIMATE_SAMPLES = 40;        // ~2 s à 50 ms
 const BIAS_REESTIMATE_BLEND = 0.15;        // part du nouveau biais dans le mélange
 
 export function useRpmSensor() {
@@ -78,6 +89,8 @@ export function useRpmSensor() {
   const releaseCountRef = useRef(0);            // compteur d'échantillons away consécutifs
   const releaseNearPrevRef = useRef(false);     // pour ne déclencher qu'à l'ENTRÉE dans la bande
   const wasStoppedRef = useRef(true);           // pour ré-accrocher vite au redémarrage
+  const relockCountRef = useRef(0);             // compteur du ré-accrochage (vrai geste requis)
+  const lastUiUpdateRef = useRef(0);            // throttle des re-renders UI
   const restBiasSamplesRef = useRef([]);        // échantillons à l'arrêt -> re-calibration du biais
   const fastSpeedTrackerRef = useRef(null);     // suivi rapide pour détecter les arrêts brutaux
   const stopCandidateCountRef = useRef(0);      // échantillons consécutifs sous le seuil d'arrêt
@@ -87,15 +100,17 @@ export function useRpmSensor() {
 
   const senderRef = useRef(null);
   if (senderRef.current === null) {
+    // onSuccess/onError ne mettent à jour le state QUE si l'état change,
+    // sinon chaque envoi (5 Hz) déclencherait un re-render inutile.
     senderRef.current = createSpeedSender(() => rpmRef.current, {
-      onSuccess: () => setSendStatus('ok'),
-      onError: () => setSendStatus('error'),
+      onSuccess: () => setSendStatus((prev) => (prev === 'ok' ? prev : 'ok')),
+      onError: () => setSendStatus((prev) => (prev === 'error' ? prev : 'error')),
     });
   }
 
   useEffect(() => {
     Gyroscope.setUpdateInterval(SENSOR_UPDATE_INTERVAL_MS);
-    Accelerometer.setUpdateInterval(SENSOR_UPDATE_INTERVAL_MS);
+    Accelerometer.setUpdateInterval(ACCEL_UPDATE_INTERVAL_MS);
     return () => {
       gyroSubRef.current?.remove();
       accelSubRef.current?.remove();
@@ -140,6 +155,7 @@ export function useRpmSensor() {
     releaseCountRef.current = 0;
     releaseNearPrevRef.current = false;
     wasStoppedRef.current = true;
+    relockCountRef.current = 0;
     restBiasSamplesRef.current = [];
     fastSpeedTrackerRef.current = null;
     stopCandidateCountRef.current = 0;
@@ -276,14 +292,34 @@ export function useRpmSensor() {
       // La direction est le signe du produit scalaire (instantanée : backspin
       // et scratch changent de sens en <30ms). La vitesse axiale est lissée
       // fortement pour rester stable malgré le bruit du gyro.
-      // Ré-accrochage rapide : après un arrêt, dès que la platine redémarre,
-      // on colle directement la valeur au lieu de remonter lentement (le
-      // lissage fort mettait ~2-3 s à remonter).
-      const isSpinning = absSpeed > 1.0;
-      if (wasStoppedRef.current && isSpinning) {
-        smootherRef.current.snapTo(absSpeed * (60 / (2 * Math.PI)));
+      // Ré-accrochage : après un arrêt, il faut un VRAI geste (vitesse
+      // soutenue ~28,6 RPM pendant 3 échantillons) pour recoller la valeur —
+      // un petit mouvement du poignet (±17 RPM) ne doit plus rien déclencher.
+      if (wasStoppedRef.current) {
+        if (absSpeed < STOPPED_RAD_S) {
+          // toujours (quasi) à l'arrêt : on recolle à 0 pour ne laisser
+          // aucune traîne résiduelle après un petit geste
+          smootherRef.current.snapTo(0);
+          relockCountRef.current = 0;
+          rpmRef.current = 0;
+        } else {
+          relockCountRef.current = relockStep(relockCountRef.current, absSpeed);
+          if (relockCountRef.current >= RELOCK_CONSECUTIVE) {
+            smootherRef.current.snapTo(absSpeed * (60 / (2 * Math.PI)));
+            relockCountRef.current = 0;
+            wasStoppedRef.current = false;
+            console.log('[RPM] Vrai mouvement détecté -> ré-accrochage direct');
+          }
+        }
+      } else if (absSpeed < STOPPED_RAD_S) {
+        // on retombe vraiment à l'arrêt : on recolle à 0 et on se remet en
+        // attente d'un vrai geste pour repartir
+        wasStoppedRef.current = true;
+        relockCountRef.current = 0;
+        smootherRef.current.snapTo(0);
+        setRpm(0);
+        rpmRef.current = 0;
       }
-      wasStoppedRef.current = !isSpinning;
 
       const direction = absSpeed < ZERO_DEADBAND_RAD_S ? 0 : dot >= 0 ? 1 : -1;
 
@@ -311,12 +347,17 @@ export function useRpmSensor() {
         console.log(`[RPM] Platine relâchée -> accrochage direct à ${cible.toFixed(1)} RPM`);
       }
       releaseCountRef.current = rawAway ? Math.min(50, releaseCountRef.current + 1) : 0;
-      releaseAwayRef.current = releaseCountRef.current >= 10; // ~300 ms soutenus
+      releaseAwayRef.current = releaseCountRef.current >= 10; // ~500 ms soutenus à 50 ms
       releaseNearPrevRef.current = near;
 
       const rpmSigne = direction * rpmBrut * gainRef.current;
-      setRpm(rpmSigne);
       rpmRef.current = rpmSigne;
+      // Throttle UI : on ne re-rend que ~12 fois/s, pas à chaque échantillon
+      // gyro (batterie/CPU). Le sender lit rpmRef, lui, à chaque échantillon.
+      if (now - lastUiUpdateRef.current >= UI_UPDATE_INTERVAL_MS) {
+        lastUiUpdateRef.current = now;
+        setRpm(rpmSigne);
+      }
 
       // Logs limités à ~2 par seconde (le gyro émet toutes les 30ms)
       const nowLog = Date.now();

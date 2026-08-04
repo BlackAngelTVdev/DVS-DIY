@@ -21,6 +21,9 @@ const {
   createSmoother,
   autoCorrectGain,
   detectRelease,
+  relockStep,
+  RELOCK_MIN_RAD_S,
+  RELOCK_CONSECUTIVE,
   closestStandard,
   ZERO_DEADBAND_RAD_S,
   CALIBRATION_TIMINGS,
@@ -92,6 +95,7 @@ try {
     let tracker = null;
     let stopCount = 0;
     let releaseAway = false, releaseCount = 0, nearPrev = false;
+    let wasStopped = true, relockCount = 0; // ré-accrochage strict (comme le hook)
     const gain = 1.0;
     const trace = [];
     for (const s of corrected.slice(50)) {
@@ -113,6 +117,24 @@ try {
       }
       stopCount = 0;
       tracker = tracker === null ? absSpeed : 0.35 * absSpeed + 0.65 * tracker;
+      // ré-accrochage strict : vrai geste (>= RELOCK_MIN_RAD_S) soutenu 3 échantillons
+      if (wasStopped) {
+        if (absSpeed < 1.0) {
+          smoother.snapTo(0);
+          relockCount = 0;
+        } else {
+          relockCount = relockStep(relockCount, absSpeed);
+          if (relockCount >= RELOCK_CONSECUTIVE) {
+            smoother.snapTo(absSpeed * RAD2RPM);
+            relockCount = 0;
+            wasStopped = false;
+          }
+        }
+      } else if (absSpeed < 1.0) {
+        wasStopped = true;
+        relockCount = 0;
+        smoother.snapTo(0);
+      }
       const direction = absSpeed < ZERO_DEADBAND_RAD_S ? 0 : dot >= 0 ? 1 : -1;
       let module = smoother.update(absSpeed * RAD2RPM);
       // relâchement : accrochage direct à la standard (comme le hook, sur la vitesse BRUTE)
@@ -363,6 +385,61 @@ try {
   console.log('\n[7] Constantes de calibration');
   check('BIAS_CALIBRATION_MS = 3000 (3 s)', CALIBRATION_TIMINGS.BIAS_CALIBRATION_MS === 3000);
   check('AXIS_CALIBRATION_MS = 1500 (1,5 s)', CALIBRATION_TIMINGS.AXIS_CALIBRATION_MS === 1500);
+  check('RELOCK_MIN_RAD_S = 3.0 (~28,6 RPM)', RELOCK_MIN_RAD_S === 3.0);
+  check('RELOCK_CONSECUTIVE = 3 échantillons', RELOCK_CONSECUTIVE === 3);
+
+  // --- 8. Ré-accrochage STRICT après arrêt ---
+  // L'utilisateur : "quand le plateau est arrêté, je bouge à peine et il me
+  // met -17/+17". Un petit geste ne doit RIEN déclencher ; un vrai scratch/sec
+  // (>= ~28,6 RPM soutenu) doit accrocher directement.
+  console.log('\n[8] Ré-accrochage strict après arrêt');
+  {
+    // unit : relockStep
+    check('relockStep : 2 rad/s (petit geste) -> 0', relockStep(2, 2.0) === 0);
+    check('relockStep : 3.5 rad/s (vrai geste) -> incrémente', relockStep(0, 3.5) === 1);
+    check('relockStep : sous le seuil remet à 0', relockStep(2, 1.5) === 0);
+
+    // scénario : arrêt puis petit geste (±17 RPM ≈ 1.78 rad/s) pendant 30
+    // échantillons -> ne doit PAS ré-accrocher (le lissé reste ~0)
+    {
+      const bias = { x: 0, y: 0, z: 0 };
+      const samples = [];
+      for (let i = 0; i < 50; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: RPM33 + noise(0.05) }); // axe
+      for (let i = 0; i < 40; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: RPM33 + noise(0.05) }); // mesure
+      for (let i = 0; i < 30; i++) samples.push({ x: noise(0.05), y: noise(0.05), z: noise(0.05) });          // arrêt
+      // petit geste : le plateau bouge à peine (vitesse qui monte à ~17 RPM max)
+      for (let i = 0; i < 30; i++) {
+        const s = Math.sin((Math.PI * i) / 30); // 0 -> 1 -> 0
+        samples.push({ x: noise(0.05), y: noise(0.05), z: (RPM33 * 0.5) * s + noise(0.05) }); // max ~16,7 RPM
+      }
+      const r = simulate(samples, bias);
+      const end = r.trace[r.trace.length - 1];
+      const maxAbs = Math.max(...r.trace.slice(-30).map(Math.abs));
+      console.log(`     petit geste : max affiché ${maxAbs.toFixed(1)} RPM, fin ${end.toFixed(1)}`);
+      check('petit geste (±17) : pas de faux ré-accrochage (< 3 RPM)', maxAbs < 3, maxAbs.toFixed(1));
+      check('petit geste : retombe à ~0 quand on arrête de bouger', close(end, 0, 0.5), end.toFixed(1));
+    }
+
+    // scénario : arrêt puis vrai scratch (vitesse soutenue ~33 RPM) -> accroche direct
+    {
+      const bias = { x: 0, y: 0, z: 0 };
+      const samples = [];
+      for (let i = 0; i < 50; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: RPM33 + noise(0.05) });
+      for (let i = 0; i < 40; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: RPM33 + noise(0.05) });
+      for (let i = 0; i < 30; i++) samples.push({ x: noise(0.05), y: noise(0.05), z: noise(0.05) });
+      // vrai scratch : montée franche à ~33 RPM maintenue
+      for (let i = 0; i < 40; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: RPM33 + noise(0.05) });
+      const r = simulate(samples, bias);
+      const end = r.trace[r.trace.length - 1];
+      // la trace commence à l'échantillon 50 : mesure 40 (0-39) + arrêt 30 (40-69)
+      // -> le scratch commence à l'index 70 de la trace. Il doit accrocher en
+      // 3 échantillons (relock strict) soit <= 73.
+      const firstHigh = r.trace.findIndex((v, i) => i >= 68 && v > 25);
+      console.log(`     vrai scratch : premier échantillon > 25 RPM à l'index ${firstHigh}`);
+      check('vrai scratch : accroche en <4 échantillons après le début du geste', firstHigh >= 70 && firstHigh <= 73, `index ${firstHigh}`);
+      check('vrai scratch : valeur finale ~33.3', close(end, 33.33, 1.5), end.toFixed(1));
+    }
+  }
 
   console.log(`\n===== ${pass} OK / ${fail} ECHEC =====`);
   process.exit(fail === 0 ? 0 : 1);

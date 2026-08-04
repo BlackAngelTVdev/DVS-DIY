@@ -20,7 +20,7 @@ export const SERVER_IP = '192.168.1.140';
 const SERVER_PORT = 5005;
 const REFERENCE_RPM = 33.33; // 1.0 = cette vitesse
 
-const SEND_INTERVAL_MS = 100; // 10 Hz : bien sous le timeout de 0.5s, et assez rapide pour le scratch
+const SEND_INTERVAL_MS = 200; // 5 Hz : optimisé batterie (Wi-Fi radio), reste 2,5x sous le timeout 0,5 s
 
 /**
  * Crée un "sender" qui interroge en continu la dernière valeur de RPM

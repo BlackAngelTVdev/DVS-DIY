@@ -232,6 +232,28 @@ export function detectRelease(smoothedRpm, rawRpm, band = GAIN_BAND) {
   return { near, rawAway };
 }
 
+// --- Ré-accrochage après arrêt : il faut un VRAI geste ---
+// Le ré-accrochage (relock) après un arrêt se déclenche quand la platine
+// repart. Avant, n'importe quel petit mouvement (absSpeed > 1 rad/s ≈
+// 9,5 RPM) recollait la valeur instantanément -> affichage de ±17 RPM en
+// bougeant à peine. Désormais il faut une vitesse SOUTENUE élevée
+// (3 rad/s ≈ 28,6 RPM, un vrai scratch/sec) pendant plusieurs échantillons
+// consécutifs.
+export const RELOCK_MIN_RAD_S = 3.0; // ~28,6 RPM : en dessous, on ne ré-accroche pas
+export const RELOCK_CONSECUTIVE = 3; // 3 échantillons consécutifs au-dessus du seuil
+// Sous cette vitesse (~9,5 RPM) on considère la platine comme (quasi) à
+// l'arrêt : on recolle à 0 et on attend un vrai geste pour repartir.
+export const STOPPED_RAD_S = 1.0;
+
+/**
+ * Fonction pure du compteur de ré-accrochage : incrémente quand la vitesse
+ * dépasse le seuil, remet à 0 sinon. Le hook ré-accroche quand le compteur
+ * atteint RELOCK_CONSECUTIVE.
+ */
+export function relockStep(count, absSpeedRadS) {
+  return absSpeedRadS >= RELOCK_MIN_RAD_S ? count + 1 : 0;
+}
+
 // Zone morte : en dessous de cette vitesse angulaire (rad/s) on considère
 // que la platine est à l'arrêt -> direction 0 et RPM nul.
 // (Un peu large : la magnitude du vecteur gyro au repos = sqrt(3) x le
