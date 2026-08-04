@@ -1,8 +1,8 @@
 {
   "expo": {
     "name": "PhaseApp",
-    "slug": "PhaseApp",
-    "version": "1.0.0",
+    "slug": "phase",
+    "version": "beta1.0.1",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -15,10 +15,21 @@
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
-      }
+      },
+      "package": "com.anonymous.PhaseApp",
+      "usesCleartextTraffic": true,
+      "permissions": [
+        "INTERNET"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "9c837c85-7c8a-4ffd-9372-28d266e4992f"
+      }
+    },
+    "owner": "djdamss-team"
   }
 }

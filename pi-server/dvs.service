@@ -1,0 +1,15 @@
+[Unit]
+Description=Serveur DVS Phase (timecode -> Rekordbox)
+After=network.target sound.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/phase
+ExecStart=/usr/bin/python3 /home/pi/phase/main.py
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
