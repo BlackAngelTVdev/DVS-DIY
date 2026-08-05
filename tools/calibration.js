@@ -249,22 +249,35 @@ const GAIN_MAX = 1.12;
 // au pitch). Le facteur d'échelle du gyro, lui, est réglé instantanément
 // par estimateGainFromSamples pendant la détection d'axe.
 const GAIN_BAND = 0.02; // ±2% autour de la vitesse standard
-
-export function autoCorrectGain(gain, speedRpm, alpha = 0.008) {
+// Le recalage lent teste la bande sur la vitesse CORRIGÉE (brut × gain) et
+// non sur le brut : sinon un gain de calibrage légitime (ex: 1.028 pour un
+// gyro qui lit 2,8% bas) serait jugé « hors bande » et ramené vers 1 par
+// l'anti-verrou — c'était LE bug : le gain instantané était posé puis détruit
+// en quelques secondes (vu en vrai : gain coincé à 1.009, RPM à 32.7).
+// Toujours clampé dans [GAIN_MIN, GAIN_MAX] pour ne jamais partir en vrille.
+export function autoCorrectGain(gain, speedRpm, alpha = 0.02) {
   const s = Math.abs(speedRpm);
   if (s < 10) return gain; // pas à l'arrêt
   const target = closestStandard(s);
-  if (Math.abs(s - target) > target * GAIN_BAND) {
-    // Hors bande : on ne corrige PAS vers la standard (respect du pitch
-    // volontaire du DJ), MAIS si le gain s'est écarté de 1 (ex: gain
-    // instantané erroné de la détection d'axe), on le ramène doucement
-    // vers 1 -> une erreur ne peut jamais rester verrouillée.
-    if (Math.abs(gain - 1) > 0.01) {
-      return gain > 1 ? Math.max(1, gain - alpha * 0.5) : Math.min(1, gain + alpha * 0.5);
-    }
-    return gain;
-  }
   const corrected = s * gain;
+  const inBand = Math.abs(corrected - target) <= target * GAIN_BAND;
+  // Anti-verrou : un gain VRAIMENT loin de 1 (ex: mauvaise calib d'axe
+  // posant 1.11) est ramené doucement vers 1 — MÊME si la vitesse corrigée
+  // tombe dans la bande (sinon 30×1.11≈33.3 serait verrouillé à vie).
+  // Un gain de calibrage légitime (≤ ~5%) survit TOUJOURS : hors bande à
+  // cause d'un PITCH volontaire (ex: 34.5 → corrigé 35.5), on ne le dissout
+  // jamais, sinon la compensation d'échelle serait érodée et le pitch affiché
+  // dériverait vers le brut (c'était le point bloquant de la review).
+  // ⚠️ Note : seuil 0.05 plus strict que AXIS_GAIN_BAND (0.06) → un capteur
+  // à erreur d'échelle 5-5,5% voit son gain légitime (~1.058) décroître à
+  // ~1.05 puis la correction douce le repousse : petite oscillation bornée,
+  // affichage ~0,5% bas — auto-limitée, acceptable. C'est le prix du pitch
+  // parfaitement respecté.
+  if (Math.abs(gain - 1) > 0.05) {
+    const next = gain > 1 ? gain - alpha * 0.25 : gain + alpha * 0.25;
+    return Math.min(GAIN_MAX, Math.max(GAIN_MIN, next));
+  }
+  if (!inBand) return gain; // pitch volontaire du DJ : gain légitime intact
   return Math.min(GAIN_MAX, Math.max(GAIN_MIN, gain + alpha * (target - corrected) / target));
 }
 

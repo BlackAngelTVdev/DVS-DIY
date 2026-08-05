@@ -331,6 +331,26 @@ try {
     for (let i = 0; i < 5000; i++) gP = autoCorrectGain(gP, 34.5);
     check('pitch +3,5% (34.5) -> gain inchangé', close(gP, 1.0, 0.001), gP.toFixed(3));
 
+    // c3) LE CAS TERRAIN (le bug) : gyro qui lit 32.4 (2,8% bas) avec un gain
+    //    déjà posé par la calib d'axe (1.009). L'ANCIEN code jugeait 32.4 hors
+    //    bande (±2% de 33.33) et ramenait le gain vers 1 -> affiché 32.7 en
+    //    permanence. Le nouveau code teste la bande sur la vitesse CORRIGÉE
+    //    (brut × gain) : le gain remonte vers 33.33/32.4 ≈ 1.029.
+    let gT = 1.009;
+    for (let i = 0; i < 20000; i++) gT = autoCorrectGain(gT, 32.4);
+    check('cas terrain 32.4 -> gain remonte à ~1.028', close(gT, 33.33 / 32.4, 0.003), gT.toFixed(4));
+    check('cas terrain 32.4 -> RPM affiché ~33.3', close(32.4 * gT, 33.33, 0.3), (32.4 * gT).toFixed(1));
+
+    // c4) PITCH + gain légitime (le point de la review) : la platine est en
+    //    pitch +3,5% (34.5 vrai = 33.5 brut avec gyro 2,8% bas) et le gain
+    //    d'échelle 1.028 est déjà posé. L'ancien anti-verrou hors bande le
+    //    dissolvait lentement -> l'affichage dérivait de 34.5 vers 33.5.
+    //    Désormais un gain légitime (|gain-1| <= 5%) n'est JAMAIS touché.
+    let gP2 = 1.0287;
+    for (let i = 0; i < 20000; i++) gP2 = autoCorrectGain(gP2, 33.5); // brut d'un 34.5 vrai
+    check('pitch 34.5 + gain légitime -> gain intact', close(gP2, 1.0287, 0.002), gP2.toFixed(4));
+    check('pitch 34.5 + gain légitime -> RPM affiché ~34.5', close(33.5 * gP2, 34.5, 0.3), (33.5 * gP2).toFixed(1));
+
     // d) 30 RPM (10% hors bande, décalage volontaire du DJ) -> PAS touché
     let g4 = 1.0;
     for (let i = 0; i < 5000; i++) g4 = autoCorrectGain(g4, 30.0);
@@ -341,12 +361,16 @@ try {
     g5 = autoCorrectGain(g5, 33.33);
     check('gain clampé à 1.12 max', g5 <= 1.12, g5.toFixed(3));
 
-    // f) gain erroné (ex: gain instantané posé pendant l'axe à 30 RPM) qui
-    //    pousse la lecture hors bande -> il DOIT décroître vers 1, jamais
-    //    d'erreur verrouillée
+    // f) gain erroné (ex: gain posé par erreur à 1.11 pendant l'axe) qui
+    //    pousse la lecture hors bande -> il DOIT décroître, jamais d'erreur
+    //    verrouillée. Il décroît jusqu'à la frontière de la bande légitime
+    //    (|gain-1| <= 5%) puis s'y stabilise : en dessous, on présume le gain
+    //    légitime et on ne le touche plus (sinon un pitch réel éroderait la
+    //    compensation d'échelle — cf. c4).
     let g6 = 1.11;
     for (let i = 0; i < 5000; i++) g6 = autoCorrectGain(g6, 37.0); // lecture corrigée hors bande
-    check('gain erroné hors bande -> revient vers 1 (pas de verrou)', close(g6, 1.0, 0.02), g6.toFixed(3));
+    check('gain erroné hors bande -> décroît sous 1.05 (pas de verrou)', g6 <= 1.05, g6.toFixed(3));
+    check('gain erroné hors bande -> a bien décru (1.11 -> <1.06)', g6 < 1.06, g6.toFixed(3));
   }
 
   // --- 4b. Gain INSTANTANÉ pendant la détection d'axe ---
