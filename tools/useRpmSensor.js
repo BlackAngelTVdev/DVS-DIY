@@ -13,14 +13,14 @@ import {
   computeBias,
   computeMagnitude,
   detectRotationAxis,
-  createSmoother,
+  createPhaseEstimator,
   autoCorrectGain,
   estimateGainFromSamples,
   detectRelease,
   relockStep,
+  MOTION_SNAP_RPM,
   RELOCK_CONSECUTIVE,
   STOPPED_RAD_S,
-  closestStandard,
   ZERO_DEADBAND_RAD_S,
   CALIBRATION_TIMINGS,
 } from './calibration';
@@ -28,11 +28,13 @@ import { createSpeedSender, SEND_INTERVAL_MS, SLOW_INTERVAL_MS } from './speedSe
 
 const { BIAS_CALIBRATION_MS, AXIS_CALIBRATION_MS } = CALIBRATION_TIMINGS;
 
-// --- Optimisation batterie ---
-// Le gyro tourne à 20 Hz (50 ms) au lieu de 33 Hz : amplement suffisant
-// pour le DVS (le lissage fait le reste) et ~40% d'énergie capteur en moins.
-// L'accéléromètre ne sert qu'au rejet de choc -> encore moins sollicité.
-const SENSOR_UPDATE_INTERVAL_MS = 50;
+// --- Cadence des capteurs ---
+// PENDANT la mesure : gyro à 100 Hz (10 ms) -> détections (arrêt, scratch,
+// relock) quasi instantanées, ~5x plus rapides qu'avant. À L'ARRÊT : on
+// repasse à 20 Hz (50 ms) pour économiser la batterie (le téléphone reste
+// souvent posé sur une platine éteinte).
+const SENSOR_UPDATE_INTERVAL_MS = 50;  // au repos / calibration biais
+const SENSOR_FAST_INTERVAL_MS = 10;    // pendant la mesure (100 Hz)
 const ACCEL_UPDATE_INTERVAL_MS = 100;
 // Le state React (re-render de l'UI) n'a besoin que de ~12,5 fps pour un
 // affichage de chiffres : on met à jour rpmRef (lu par le sender) à chaque
@@ -50,16 +52,20 @@ const ACCEL_SHOCK_THRESHOLD = 0.25; // en g
 const STOP_DETECTION_FAST_ALPHA = 0.35;  // réactivité du suivi rapide
 const STOP_DETECTION_RATIO = 0.10;       // chute sous 10% de la vitesse = arrêt
 const STOP_DETECTION_MIN_RAD_S = 1.0;    // ne déclenche que si on tournait à ~9.5+ RPM
-// Il faut 2 échantillons consécutifs sous le seuil pour déclencher l'arrêt :
-// un simple croisement du zéro pendant un scratch/backspin ne suffit pas.
-const STOP_DETECTION_CONSECUTIVE = 2;
+
 
 // Re-calibration continue du biais : quand le téléphone est immobile (platine
 // à l'arrêt) pendant ~2 s, on réestime le biais et on le mélange doucement au
 // biais actuel (compense la dérive du gyro avec la chaleur/temps).
 const BIAS_REESTIMATE_RAW_MAG_MAX = 0.35; // rad/s : en dessous = immobile
-const BIAS_REESTIMATE_SAMPLES = 40;        // ~2 s à 50 ms
-const BIAS_REESTIMATE_BLEND = 0.15;        // part du nouveau biais dans le mélange
+const BIAS_REESTIMATE_MS = 2000;          // ~2 s d'immobilité
+const BIAS_REESTIMATE_BLEND = 0.15;       // part du nouveau biais dans le mélange
+// Durée "away" soutenue requise avant de considérer le relâchement (hystérésis)
+const RELEASE_AWAY_MS = 300;              // ~300 ms hors bande
+// Détection d'arrêt brutal : chute SOUTENUE sous 10% de la vitesse pendant
+// ~100 ms. À 100 Hz c'est 10 échantillons : un passage à zéro d'un scratch
+// (rapide, <100 ms) ne déclenche PAS un faux arrêt.
+const STOP_DETECTION_MS = 100;
 
 export function useRpmSensor() {
   const [phase, setPhase] = useState('idle'); // idle | calibratingBias | readyToSpin | calibratingAxis | measuring
@@ -87,17 +93,19 @@ export function useRpmSensor() {
   const axisVectorRef = useRef(null); // vecteur unitaire de l'axe calibré (null = pas encore détecté)
 
   const rejectedRef = useRef(0);
-  const smootherRef = useRef(createSmoother()); // lisse la vitesse axiale (pas la direction)
+  const phaseRef = useRef(createPhaseEstimator()); // intègre la vitesse axiale (fenêtre 3,5 s)
   const gainRef = useRef(1);                    // recalage auto de la vitesse (vers 33/45/78)
   const releaseAwayRef = useRef(false);         // état "loin d'une standard" SOUTENU
   const releaseCountRef = useRef(0);            // compteur d'échantillons away consécutifs
   const releaseNearPrevRef = useRef(false);     // pour ne déclencher qu'à l'ENTRÉE dans la bande
+  const releaseArmedRef = useRef(false);        // relâchement ARMÉ seulement après un VRAI arrêt
   const wasStoppedRef = useRef(true);           // pour ré-accrocher vite au redémarrage
   const relockCountRef = useRef(0);             // compteur du ré-accrochage (vrai geste requis)
   const lastUiUpdateRef = useRef(0);            // throttle des re-renders UI
   const restBiasSamplesRef = useRef([]);        // échantillons à l'arrêt -> re-calibration du biais
+  const restBiasStartRef = useRef(null);        // instant du 1er échantillon d'immobilité (durée, pas comptage)
   const fastSpeedTrackerRef = useRef(null);     // suivi rapide pour détecter les arrêts brutaux
-  const stopCandidateCountRef = useRef(0);      // échantillons consécutifs sous le seuil d'arrêt
+  const stopCandidateStartRef = useRef(null);   // instant du 1er échantillon sous le seuil d'arrêt
   const lastLogTimeRef = useRef(0);             // pour limiter la fréquence des logs
   const standardSpeedRef = useRef(33.33);       // miroir de standardSpeed pour le callback gyro
   const stabilityRingRef = useRef([]);          // dernières valeurs lissées -> déviation
@@ -124,6 +132,20 @@ export function useRpmSensor() {
       senderRef.current.stop();
     };
   }, []);
+
+  // Cadence du gyro : 100 Hz pendant la mesure (réactivité ms), 20 Hz sinon
+  // (économie batterie quand le téléphone reste posé sur la platine éteinte).
+  const setGyroRate = (fast) => {
+    try {
+      Gyroscope.setUpdateInterval(fast ? SENSOR_FAST_INTERVAL_MS : SENSOR_UPDATE_INTERVAL_MS);
+    } catch (err) {
+      console.warn('[RPM] setUpdateInterval gyro :', err);
+    }
+  };
+
+  // Nombre d'échantillons équivalent à une durée, au taux RAPIDE du gyro
+  // (les compteurs de détection sont des durées en ms, pas des échantillons).
+  const nFast = (ms) => Math.max(1, Math.ceil(ms / SENSOR_FAST_INTERVAL_MS));
 
   // Cadence adaptative : 200 ms en rotation, 5 s à l'arrêt (batterie/Wi-Fi).
   // Ne recrée l'intervalle QUE si la cadence change vraiment.
@@ -172,17 +194,19 @@ export function useRpmSensor() {
   const startMeasuring = () => {
     rejectedRef.current = 0;
     setRejectedCount(0);
-    smootherRef.current.reset();
+    phaseRef.current.reset();
     // NOTE : le gain N'EST PAS remis à 1 ici -> le recalage auto survit d'une
     // mesure à l'autre (il n'est remis à zéro qu'à la calibration complète).
     releaseAwayRef.current = false;
     releaseCountRef.current = 0;
     releaseNearPrevRef.current = false;
+    releaseArmedRef.current = false;
     wasStoppedRef.current = true;
     relockCountRef.current = 0;
     restBiasSamplesRef.current = [];
+    restBiasStartRef.current = null;
     fastSpeedTrackerRef.current = null;
-    stopCandidateCountRef.current = 0;
+    stopCandidateStartRef.current = null;
     setRpm(0);
     rpmRef.current = 0;
     stabilityRingRef.current = [];
@@ -202,6 +226,8 @@ export function useRpmSensor() {
       }
     });
 
+    setGyroRate(true); // 100 Hz pendant la mesure (réactivité quasi-ms)
+
     gyroSubRef.current = Gyroscope.addListener(({ x, y, z }) => {
       try {
       // On soustrait le biais mesuré à l'étape 1
@@ -217,8 +243,12 @@ export function useRpmSensor() {
       // (médiane, robuste) et on le mélange doucement (dérive thermique).
       const rawMag = computeMagnitude({ x, y, z });
       if (axisVectorRef.current !== null && rawMag < BIAS_REESTIMATE_RAW_MAG_MAX) {
+        // Durée RÉELLE d'immobilité (le gyro est à 20 Hz à l'arrêt, pas 100 Hz
+        // : compter des échantillons ferait 5x plus long). ~2 s d'immobilité
+        // -> on réestime le biais (médiane, robuste) et on le mélange doucement.
+        if (restBiasStartRef.current === null) restBiasStartRef.current = now;
         restBiasSamplesRef.current.push({ x, y, z });
-        if (restBiasSamplesRef.current.length >= BIAS_REESTIMATE_SAMPLES) {
+        if (now - restBiasStartRef.current >= BIAS_REESTIMATE_MS) {
           const nb = computeBias(restBiasSamplesRef.current);
           biasRef.current = {
             x: (1 - BIAS_REESTIMATE_BLEND) * biasRef.current.x + BIAS_REESTIMATE_BLEND * nb.x,
@@ -226,11 +256,13 @@ export function useRpmSensor() {
             z: (1 - BIAS_REESTIMATE_BLEND) * biasRef.current.z + BIAS_REESTIMATE_BLEND * nb.z,
           };
           restBiasSamplesRef.current = [];
+          restBiasStartRef.current = null;
           console.log('[RPM] Biais recalibré à l\'arrêt:',
             biasRef.current.x.toFixed(3), biasRef.current.y.toFixed(3), biasRef.current.z.toFixed(3));
         }
       } else {
         restBiasSamplesRef.current = [];
+        restBiasStartRef.current = null;
       }
 
       // --- Sous-phase : détection de l'axe de rotation ---
@@ -291,8 +323,8 @@ export function useRpmSensor() {
       // --- Détection d'arrêt brutal ---
       // Si ça tournait à une vitesse significative et que ça chute d'un coup
       // à moins de 10% de cette vitesse, la platine vient de s'arrêter net.
-      // On exige STOP_DETECTION_CONSECUTIVE échantillons de suite pour ne pas
-      // déclencher sur le simple passage à zéro d'un scratch/backspin.
+      // On exige une chute SOUTENUE pendant ~100 ms (durée, pas échantillons)
+      // pour ne pas déclencher sur le simple passage à zéro d'un scratch.
       // Quand ça déclenche : RPM à 0 et ratio 0 envoyé immédiatement au
       // serveur (au lieu d'attendre le prochain tick du sender).
       if (
@@ -300,22 +332,25 @@ export function useRpmSensor() {
         fastSpeedTrackerRef.current > STOP_DETECTION_MIN_RAD_S &&
         absSpeed < fastSpeedTrackerRef.current * STOP_DETECTION_RATIO
       ) {
-        stopCandidateCountRef.current += 1;
-        // on ne met PAS à jour le tracker pendant un candidat, sinon il
-        // chuterait à sa propre valeur et la condition ne tiendrait plus
-        if (stopCandidateCountRef.current >= STOP_DETECTION_CONSECUTIVE) {
-          stopCandidateCountRef.current = 0;
-          smootherRef.current.snapTo(0);
+        // Chute SOUTENUE pendant ~100 ms (durée réelle, pas un compteur
+        // d'échantillons : à 100 Hz, 2 échantillons = 20 ms, ce qui serait
+        // déclenché par un simple passage à zéro d'un scratch).
+        if (stopCandidateStartRef.current === null) stopCandidateStartRef.current = now;
+        if (now - stopCandidateStartRef.current >= STOP_DETECTION_MS) {
+          stopCandidateStartRef.current = null;
+          phaseRef.current.snapTo(0, now);
+          releaseArmedRef.current = true; // un vrai arrêt arme le relâchement
           fastSpeedTrackerRef.current = 0;
           setRpm(0);
           rpmRef.current = 0;
           senderRef.current.sendNow(0);
           setSendCadence(false); // platine arrêtée : on ralentit l'envoi (5 s)
+          setGyroRate(false);    // gyro à 20 Hz : économie batterie à l'arrêt
           console.log('[RPM] Arrêt brutal détecté -> reset immédiat à 0');
         }
         return;
       }
-      stopCandidateCountRef.current = 0;
+      stopCandidateStartRef.current = null;
 
       fastSpeedTrackerRef.current =
         fastSpeedTrackerRef.current === null
@@ -339,36 +374,62 @@ export function useRpmSensor() {
       // soutenue ~28,6 RPM pendant 3 échantillons) pour recoller la valeur —
       // un petit mouvement du poignet (±17 RPM) ne doit plus rien déclencher.
       if (wasStoppedRef.current) {
-        if (absSpeed < STOPPED_RAD_S) {
-          // toujours (quasi) à l'arrêt : on recolle à 0 pour ne laisser
-          // aucune traîne résiduelle après un petit geste
-          smootherRef.current.snapTo(0);
+        // En attente d'un VRAI geste : on ne laisse RIEN s'accumuler dans
+        // l'estimateur (un petit mouvement du poignet ne doit produire aucun
+        // blip). On ne ré-accroche qu'à la vitesse soutenue + snap direct.
+        // Dès qu'un mouvement significatif apparaît, on repasse le gyro à
+        // 100 Hz : le compteur de relock (3 échantillons) se remplit en
+        // ~30 ms au lieu de 150 ms à 20 Hz -> redémarrage quasi instantané.
+        if (absSpeed >= 1.0) setGyroRate(true);
+        relockCountRef.current = relockStep(relockCountRef.current, absSpeed);
+        phaseRef.current.snapTo(0, now);
+        rpmRef.current = 0;
+        if (relockCountRef.current >= RELOCK_CONSECUTIVE) {
+          phaseRef.current.snapTo(absSpeed * (60 / (2 * Math.PI)), now);
           relockCountRef.current = 0;
-          rpmRef.current = 0;
-        } else {
-          relockCountRef.current = relockStep(relockCountRef.current, absSpeed);
-          if (relockCountRef.current >= RELOCK_CONSECUTIVE) {
-            smootherRef.current.snapTo(absSpeed * (60 / (2 * Math.PI)));
-            relockCountRef.current = 0;
-            wasStoppedRef.current = false;
-            setSendCadence(true); // la platine tourne de nouveau : envoi rapide
-            console.log('[RPM] Vrai mouvement détecté -> ré-accrochage direct');
-          }
+          wasStoppedRef.current = false;
+          setSendCadence(true); // la platine tourne de nouveau : envoi rapide
+          setGyroRate(true);    // et gyro 100 Hz (réactivité)
+          console.log('[RPM] Vrai mouvement détecté -> ré-accrochage direct');
         }
       } else if (absSpeed < STOPPED_RAD_S) {
         // on retombe vraiment à l'arrêt : on recolle à 0 et on se remet en
         // attente d'un vrai geste pour repartir
         wasStoppedRef.current = true;
         relockCountRef.current = 0;
-        smootherRef.current.snapTo(0);
+        phaseRef.current.snapTo(0, now);
+        releaseArmedRef.current = true; // un vrai arrêt arme le relâchement
         setRpm(0);
         rpmRef.current = 0;
         setSendCadence(false); // économie batterie à l'arrêt
+        setGyroRate(false);    // et gyro à 20 Hz
       }
 
       const direction = absSpeed < ZERO_DEADBAND_RAD_S ? 0 : dot >= 0 ? 1 : -1;
 
-      const axialRpm = smootherRef.current.update(absSpeed * (60 / (2 * Math.PI)));
+      // ESTIMATEUR DE PHASE : intégrale signée de la vitesse axiale sur la
+      // fenêtre glissante -> le bruit zéro-moyenne s'annule (stabilité) et un
+      // vrai pitch déplace la pente (sensibilité). Le module sert aux
+      // détections et au recalage, la direction reste instantanée.
+      const estRpm = phaseRef.current.update(dot, now);
+      const axialRpm = Math.abs(estRpm);
+
+      // --- MOTION SNAP : la magnitude suit la main pendant un VRAI geste ---
+      // Pendant un scratch/backspin, la vitesse axiale SENTIE change de sens
+      // instantanément, mais la fenêtre (3,5 s) met ~2 s à traverser zéro :
+      // le son "traîne" derrière la main. Si la vitesse brute SIGNÉE s'écarte
+      // de l'estimé de plus de MOTION_SNAP_RPM (le wobble max ~±18 RPM ne
+      // peut pas l'atteindre, un geste réel si), on colle l'estimateur au
+      // suivi rapide -> la magnitude répond en ~50 ms. Signe et magnitude
+      // suivent donc tous les deux la main immédiatement.
+      const rawRpmSigned = (dot >= 0 ? 1 : -1) * absSpeed * (60 / (2 * Math.PI));
+      let rpmBrut = axialRpm;
+      if (!wasStoppedRef.current && Math.abs(rawRpmSigned - estRpm) > MOTION_SNAP_RPM) {
+        const fastSigned =
+          (fastSpeedTrackerRef.current ?? absSpeed) * (60 / (2 * Math.PI)) * (dot >= 0 ? 1 : -1);
+        phaseRef.current.snapTo(fastSigned, now);
+        rpmBrut = Math.abs(fastSigned);
+      }
 
       // --- Relâchement de la platine : accrochage direct à la standard ---
       // On passait d'une vitesse "loin" (arrêt, tenue à la main hors bande)
@@ -383,20 +444,29 @@ export function useRpmSensor() {
       // simple passage hors bande dû au bruit, et on ne déclenche qu'à
       // l'ENTRÉE de la vitesse brute dans la bande (la platine relâchée
       // revient d'elle-même -> on colle la cible sans rampe).
-      const { near, rawAway } = detectRelease(axialRpm, rawRpm);
-      let rpmBrut = axialRpm;
-      if (releaseAwayRef.current && near && !releaseNearPrevRef.current) {
-        // cible = vitesse standard choisie dans l'UI si la platine y revient,
-        // sinon la standard la plus proche de la vitesse réelle
-        const sel = standardSpeedRef.current;
-        const cible = Math.abs(rawRpm - sel) <= sel * 0.06 ? sel : closestStandard(rawRpm);
-        smootherRef.current.snapTo(cible / gainRef.current);
-        rpmBrut = cible / gainRef.current;
+      // La détection est RELATIVE à la vitesse standard choisie dans l'UI :
+      // un 33 bruyant ne doit jamais déclencher un relâchement vers 45.
+      const sel = standardSpeedRef.current;
+      const { near, rawAway } = detectRelease(axialRpm, rawRpm, undefined, sel);
+      if (releaseAwayRef.current && near && !releaseNearPrevRef.current && releaseArmedRef.current) {
+        // seulement si la platine a VRAIMENT été arrêtée/tenue depuis : sans
+        // ça, un 33 stable mais bruyant déclencherait des snaps en boucle.
+        releaseArmedRef.current = false;
+        phaseRef.current.snapTo(sel / gainRef.current, now);
+        rpmBrut = sel / gainRef.current;
         setSendCadence(true);
-        console.log(`[RPM] Platine relâchée -> accrochage direct à ${cible.toFixed(1)} RPM`);
+        setGyroRate(true);
+        console.log(`[RPM] Platine relâchée -> accrochage direct à ${sel.toFixed(1)} RPM`);
       }
-      releaseCountRef.current = rawAway ? Math.min(50, releaseCountRef.current + 1) : 0;
-      releaseAwayRef.current = releaseCountRef.current >= 10; // ~500 ms soutenus à 50 ms
+      // "away" décroît au lieu de se remettre à zéro (hystérésis) : un seul
+      // échantillon dans la bande (ex: juste après un ré-accrochage à ~31.8)
+      // ne doit pas éteindre la détection avant l'entrée dans la bande.
+      releaseCountRef.current = rawAway
+        ? Math.min(2 * nFast(RELEASE_AWAY_MS), releaseCountRef.current + 1)
+        : Math.max(0, releaseCountRef.current - 1);
+      // ~300 ms soutenus (à 100 Hz) : l'hystérésis ne s'éteint jamais sur un
+      // seul échantillon, et un bref passage hors bande ne déclenche rien.
+      releaseAwayRef.current = releaseCountRef.current >= nFast(RELEASE_AWAY_MS);
       releaseNearPrevRef.current = near;
 
       const rpmSigne = direction * rpmBrut * gainRef.current;
@@ -445,6 +515,7 @@ export function useRpmSensor() {
     // Envoie ratio 0 (pause côté serveur) puis coupe l'envoi périodique.
     senderRef.current.sendNow(0);
     senderRef.current.stop();
+    setGyroRate(false); // retour au taux économie
     setSendStatus('idle');
     setPhase('idle');
   };

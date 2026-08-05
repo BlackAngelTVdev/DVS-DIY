@@ -20,8 +20,11 @@ export const SERVER_IP = '192.168.1.140';
 const SERVER_PORT = 5005;
 const REFERENCE_RPM = 33.33; // 1.0 = cette vitesse
 
-export const SEND_INTERVAL_MS = 200; // 5 Hz : optimisé batterie (Wi-Fi radio), reste 2,5x sous le timeout 0,5 s
-// Quand la platine est à l'arrêt, on n'a pas besoin de maintenir 5 Hz : un
+export const SEND_INTERVAL_MS = 30; // ~33 Hz en rotation : scratch/arrêts/relocks quasi instantanés
+// Le garde anti-pile-up (une seule requête en vol) évite d'envoyer plus vite
+// que le réseau ne répond : l'intervalle devient en pratique "le plus rapide
+// possible sans chevauchement".
+// Quand la platine est à l'arrêt, on n'a pas besoin de maintenir 33 Hz : un
 // heartbeat toutes les 5 s suffit (le serveur ne coupe rien : la vitesse est
 // déjà à 0 et il ne logue pas les timeouts à l'arrêt). Économie Wi-Fi majeure
 // quand le téléphone reste posé sur une platine éteinte.
@@ -55,7 +58,7 @@ export function createSpeedSender(getRpmValue, options = {}) {
   const url = `http://${ip}:${port}/`;
   let intervalId = null;
   let sending = false; // garde anti-pile-up : pas de requêtes HTTP qui se chevauchent
-  const FETCH_TIMEOUT_MS = 300; // au-delà, on abandonne (serveur injoignable) pour ne jamais bloquer l'envoi
+  const FETCH_TIMEOUT_MS = 150; // au-delà, on abandonne (serveur injoignable) pour ne jamais bloquer l'envoi
 
   const sendOnce = async (overrideRpm) => {
     if (sending) return; // une requête est déjà en vol, on ignore ce tick

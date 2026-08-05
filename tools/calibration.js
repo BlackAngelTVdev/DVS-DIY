@@ -170,6 +170,59 @@ export function createSmoother() {
   };
 }
 
+// --- Estimateur de PHASE (intégrale de la vitesse angulaire) ---
+// C'est le vrai remède "stabilité + sensibilité au pitch" : au lieu de lisser
+// chaque échantillon (EMA, qui laisse passer le bruit ou traîne trop), on
+// INTÈGRE la vitesse axiale signée et on lit la pente sur une fenêtre
+// glissante (~3,5 s). Le bruit de mesure (rocking du téléphone, pics) est
+// zéro-moyenne : il s'annule dans l'intégrale, alors qu'un vrai changement
+// de pitch déplace la pente et est suivi en ~2 s. Les snaps (arrêt, relock,
+// relâchement) ré-ensemencent la fenêtre -> réponse immédiate préservée.
+export function createPhaseEstimator({ windowMs = 3500, sampleMs = 50 } = {}) {
+  const RAD2RPM = 60 / (2 * Math.PI);
+  let totalAngle = 0; // intégrale signée de la vitesse axiale (rad)
+  let lastT = null;   // dernier timestamp -> dt RÉEL (pas supposé)
+  const buf = [];     // fenêtre glissante : [{ t, angle }]
+  return {
+    /** @param dotRadS vitesse axiale SIGNÉE (rad/s) @param now ms */
+    update(dotRadS, now) {
+      // dt réel entre les échantillons : l'intégrale reste juste même si le
+      // gyro délivre à une cadence un peu différente de 50 ms (jitter, fusion
+      // d'échantillons). Borné à 5 échantillons : une longue pause (app en
+      // arrière-plan) ne doit pas intégrer des données périmées.
+      if (lastT === null) lastT = now;
+      const elapsed = Math.max(0, Math.min(now - lastT, sampleMs * 5));
+      lastT = now;
+      totalAngle += dotRadS * (elapsed / 1000);
+      buf.push({ t: now, angle: totalAngle });
+      const cutoff = now - windowMs;
+      // On n'avance le bord gauche QUE si le suivant est lui-même hors
+      // fenêtre : un bord VIRTUEL posé par snapTo survit donc jusqu'à ce que
+      // de vraies données aient rempli la fenêtre (pas d'effondrement à 50 ms
+      // juste après un arrêt/relock/relâchement).
+      while (buf.length > 2 && buf[1].t <= cutoff) buf.shift();
+      if (buf.length < 2) return 0;
+      const dt = (buf[buf.length - 1].t - buf[0].t) / 1000;
+      if (dt <= 0) return 0;
+      return ((totalAngle - buf[0].angle) / dt) * RAD2RPM;
+    },
+    // Force la sortie immédiate à `rpm` : on pose un bord gauche VIRTUEL qui
+    // implique que la vitesse valait `rpm` pendant toute la fenêtre passée.
+    snapTo(rpm, now) {
+      const velocity = rpm / RAD2RPM; // rad/s
+      totalAngle = 0;
+      lastT = now;
+      buf.length = 0;
+      buf.push({ t: now - windowMs, angle: -velocity * (windowMs / 1000) });
+    },
+    reset() {
+      totalAngle = 0;
+      lastT = null;
+      buf.length = 0;
+    },
+  };
+}
+
 // --- Vitesses standard (vinyle) ---
 export const STANDARD_SPEEDS = [33.33, 45, 78];
 
@@ -190,7 +243,12 @@ export function closestStandard(value) {
 // 36 RPM) n'est PAS écrasé.
 const GAIN_MIN = 0.88;
 const GAIN_MAX = 1.12;
-const GAIN_BAND = 0.06; // ±6% autour de la vitesse standard
+// Bande étroite ±2% : le recalage lent ne doit corriger QUE la dérive
+// résiduelle quand la platine est (quasi) pile sur une vitesse standard.
+// Un pitch volontaire du DJ (>= ~2-3%) n'est JAMAIS effacé (sensibilité
+// au pitch). Le facteur d'échelle du gyro, lui, est réglé instantanément
+// par estimateGainFromSamples pendant la détection d'axe.
+const GAIN_BAND = 0.02; // ±2% autour de la vitesse standard
 
 export function autoCorrectGain(gain, speedRpm, alpha = 0.008) {
   const s = Math.abs(speedRpm);
@@ -224,11 +282,13 @@ export function autoCorrectGain(gain, speedRpm, alpha = 0.008) {
 //    ne calibre RIEN -> le recalage lent prend le relais.
 export const AXIS_GAIN_MIN = 0.9;
 export const AXIS_GAIN_MAX = 1.15;
-// Bande ±15% : assez large pour accepter le cas réel (gyro qui lit 31.5 pour
-// une platine à 33.33, avec le bruit du capteur) et rejeter les vitesses non
-// standards (rampe, tenue à la main à 20 RPM). Un gain erroné n'est pas
-// verrouillé : autoCorrectGain le ramène vers 1 s'il sort de sa propre bande.
-export const AXIS_GAIN_BAND = 0.15; // ±15% autour d'une vitesse standard
+// Bande ±6% : couvre le facteur d'échelle typique du gyro (~5%) avec une
+// petite marge, rejette les vitesses non standards (rampe, 20 RPM à la main)
+// et préserve un pitch volontaire au-delà de ~6-7%. Un gain erroné n'est pas
+// verrouillé : autoCorrectGain le ramène vers 1 s'il sort de sa bande.
+// ⚠️ À calibrer avec le pitch de la platine à ZÉRO (sinon le pitch est
+// intégré au facteur d'échelle et affiché comme 33.33).
+export const AXIS_GAIN_BAND = 0.06; // ±6% autour d'une vitesse standard
 
 export function estimateGainFromSamples(samples, { band = AXIS_GAIN_BAND } = {}) {
   if (samples.length < 4) return 1; // pas assez d'échantillons
@@ -261,17 +321,36 @@ export function estimateGainFromSamples(samples, { band = AXIS_GAIN_BAND } = {})
  * @param smoothedRpm vitesse lissée (état global)
  * @param rawRpm      vitesse brute (moment du passage dans la bande)
  */
-export function detectRelease(smoothedRpm, rawRpm, band = GAIN_BAND) {
+// Bande de DÉTECTION du relâchement (indépendante du gain) : la platine
+// relâchée revient d'elle-même dans ~±6% de sa standard -> on s'y accroche.
+export const RELEASE_BAND = 0.06;
+
+export function detectRelease(smoothedRpm, rawRpm, band = RELEASE_BAND, target = null) {
+  // target = vitesse standard choisie dans l'UI (33/45/78) : sans elle, on
+  // tomberait dans la bande d'une AUTRE standard (ex: un 33 bruyant qui monte
+  // à 43 déclencherait un faux relâchement vers 45).
   const s = Math.abs(smoothedRpm);
-  const std = closestStandard(s);
+  const std = target ?? closestStandard(s);
   const rawAway = s <= 15 || Math.abs(s - std) > std * band;
 
   const raw = Math.abs(rawRpm);
-  const rawStd = closestStandard(raw);
+  const rawStd = target ?? closestStandard(raw);
   const near = raw > 15 && Math.abs(raw - rawStd) <= rawStd * band;
 
   return { near, rawAway };
 }
+
+// --- Suivi de la main pendant un VRAI geste (motion snap) ---
+// La fenêtre d'intégration (3,5 s) stabilise la magnitude mais TRAÎNE ~2 s
+// derrière un changement franc de vitesse (scratch, backspin, poussée à la
+// main) : le DJ entend le son "suivre" en retard. Si la vitesse BRUTE
+// s'écarte de l'estimé fenêtré de plus de ce seuil, c'est un geste réel :
+// le hook colle l'estimateur au suivi rapide pour que la magnitude suive la
+// main en ~50-100 ms au lieu de ~2 s.
+// Le wobble du rocking (déviation max ~±18 RPM observée sur les logs réels
+// ratio 0.79-1.54) ne peut PAS franchir 25 RPM -> aucune fausse détection
+// en rotation stable.
+export const MOTION_SNAP_RPM = 25;
 
 // --- Ré-accrochage après arrêt : il faut un VRAI geste ---
 // Le ré-accrochage (relock) après un arrêt se déclenche quand la platine

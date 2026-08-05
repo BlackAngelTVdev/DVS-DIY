@@ -18,11 +18,12 @@ const {
   computeBias,
   computeMagnitude,
   detectRotationAxis,
-  createSmoother,
+  createPhaseEstimator,
   autoCorrectGain,
   estimateGainFromSamples,
   detectRelease,
   relockStep,
+  MOTION_SNAP_RPM,
   RELOCK_MIN_RAD_S,
   RELOCK_CONSECUTIVE,
   closestStandard,
@@ -33,7 +34,7 @@ const {
 // speedSender.js est aussi en ESM : même copie vers un .mjs temporaire
 const senderModPath = join(dir, 'speedSender.mjs');
 writeFileSync(senderModPath, readFileSync(fileURLToPath(new URL('./speedSender.js', import.meta.url)), 'utf8'));
-const { createSpeedSender, SLOW_INTERVAL_MS } = await import(`file://${senderModPath}`);
+const { createSpeedSender, SLOW_INTERVAL_MS, SEND_INTERVAL_MS } = await import(`file://${senderModPath}`);
 
 try {
   const RAD2RPM = 60 / (2 * Math.PI);
@@ -97,15 +98,19 @@ try {
     const corrected = samples.map((s) => ({ x: s.x - bias.x, y: s.y - bias.y, z: s.z - bias.z }));
     const { vector } = detectRotationAxis(corrected.slice(0, 50));
     if (!vector) return null;
-    const smoother = createSmoother();
+    // le hook utilise l'estimateur de PHASE (intégrale fenêtrée 3,5 s)
+    const estimator = createPhaseEstimator();
+    let t = 0; // temps simulé (ms), +50 ms par échantillon
     let tracker = null;
     let stopCount = 0;
     let releaseAway = false, releaseCount = 0, nearPrev = false;
+    let releaseArmed = false; // relâchement armé seulement après un VRAI arrêt
     let wasStopped = true, relockCount = 0; // ré-accrochage strict (comme le hook)
     const gain = 1.0;
     const trace = [];
     for (const s of corrected.slice(50)) {
-      // vitesse AXIALE = |produit scalaire avec l'axe calibré| (comme le hook)
+      t += 50;
+      // vitesse AXIALE SIGNÉE = produit scalaire avec l'axe calibré
       const dot = s.x * vector.x + s.y * vector.y + s.z * vector.z;
       const absSpeed = Math.abs(dot);
       // détection d'arrêt brutal (comme dans le hook)
@@ -114,43 +119,45 @@ try {
         if (stopCount >= 2) {
           stopCount = 0;
           tracker = 0;
-          smoother.snapTo(0);
+          estimator.snapTo(0, t);
+          releaseArmed = true;
           trace.push(0);
           continue;
         }
-        trace.push(smoother.ema ?? 0);
+        trace.push(estimator.update(dot, t));
         continue;
       }
       stopCount = 0;
       tracker = tracker === null ? absSpeed : 0.35 * absSpeed + 0.65 * tracker;
-      // ré-accrochage strict : vrai geste (>= RELOCK_MIN_RAD_S) soutenu 3 échantillons
+      // en attente d'un vrai geste : rien ne s'accumule (comme le hook)
       if (wasStopped) {
-        if (absSpeed < 1.0) {
-          smoother.snapTo(0);
+        relockCount = relockStep(relockCount, absSpeed);
+        estimator.snapTo(0, t);
+        if (relockCount >= RELOCK_CONSECUTIVE) {
+          estimator.snapTo(absSpeed * RAD2RPM, t);
           relockCount = 0;
-        } else {
-          relockCount = relockStep(relockCount, absSpeed);
-          if (relockCount >= RELOCK_CONSECUTIVE) {
-            smoother.snapTo(absSpeed * RAD2RPM);
-            relockCount = 0;
-            wasStopped = false;
-          }
+          wasStopped = false;
         }
       } else if (absSpeed < 1.0) {
         wasStopped = true;
         relockCount = 0;
-        smoother.snapTo(0);
+        estimator.snapTo(0, t);
+        releaseArmed = true;
       }
       const direction = absSpeed < ZERO_DEADBAND_RAD_S ? 0 : dot >= 0 ? 1 : -1;
-      let module = smoother.update(absSpeed * RAD2RPM);
-      // relâchement : accrochage direct à la standard (comme le hook, sur la vitesse BRUTE)
+      let module = Math.abs(estimator.update(dot, t));
+      // relâchement : accrochage direct à la standard (sur la vitesse BRUTE)
       const rawRpm = absSpeed * RAD2RPM;
-      const { near, rawAway } = detectRelease(module, rawRpm);
-      if (releaseAway && near && !nearPrev) {
-        smoother.snapTo(closestStandard(rawRpm) / gain);
-        module = closestStandard(rawRpm) / gain;
+      // cible = 33.33 : la détection ne doit JAMAIS viser une autre standard
+      // (un 33 bruyant qui monte à 43 ne déclenche pas de snap vers 45)
+      const { near, rawAway } = detectRelease(module, rawRpm, undefined, 33.33);
+      if (releaseAway && near && !nearPrev && releaseArmed) {
+        releaseArmed = false;
+        estimator.snapTo(33.33 / gain, t);
+        module = 33.33 / gain;
       }
-      releaseCount = rawAway ? Math.min(50, releaseCount + 1) : 0;
+      // hystérésis : décroît au lieu de se remettre à zéro (comme le hook)
+      releaseCount = rawAway ? Math.min(50, releaseCount + 1) : Math.max(0, releaseCount - 1);
       releaseAway = releaseCount >= 10;
       nearPrev = near;
       trace.push(direction * module);
@@ -194,16 +201,21 @@ try {
   }
 
   // d) Scratch : alternance avant/arriere rapide -> le signe doit suivre
+  //    (l'estimateur de phase lisse la MAGNITUDE : un scratch est un geste,
+  //    pas un pitch -> on vérifie le sens, et la convergence d'un backspin
+  //    SOUTENU vers -33 une fois la fenêtre pleine)
   {
     const bias = { x: 0, y: 0, z: 0 };
     const samples = [];
     for (let i = 0; i < 60; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: RPM33 + noise(0.05) });
-    for (let i = 0; i < 60; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: -RPM33 + noise(0.05) });
+    for (let i = 0; i < 100; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: -RPM33 + noise(0.05) });
     const r = simulate(samples, bias);
     const secondHalf = r.trace.slice(60);
     const avgSecondHalf = secondHalf.reduce((a, b) => a + b, 0) / secondHalf.length;
+    const last10 = r.trace.slice(-10);
+    const avgLast10 = last10.reduce((a, b) => a + b, 0) / last10.length;
     check('scratch : 2e moitie en negatif', avgSecondHalf < 0, avgSecondHalf.toFixed(1));
-    check('scratch : 2e moitie proche de -33', close(avgSecondHalf, -33.33, 3.0), avgSecondHalf.toFixed(1));
+    check('scratch : backspin soutenu -> ~-33 en fin de fenêtre', close(avgLast10, -33.33, 1.5), avgLast10.toFixed(1));
   }
 
   // e) Arret brutal : plateau stoppe -> retombe vers 0
@@ -299,20 +311,25 @@ try {
   // --- 4. Recalage automatique du gain (31-32 -> 33.3) ---
   console.log('\n[4] Recalage automatique du gain');
   {
-    // a) 31.5 RPM (sous-comptage classique) -> le gain monte et corrige vers 33.33
+    // a) 33.0 RPM (dérive résiduelle < 2%) -> le gain corrige doucement vers 33.33
     let gain = 1.0;
-    for (let i = 0; i < 5000; i++) gain = autoCorrectGain(gain, 31.5);
-    check('31.5 RPM -> corrigé vers 33.3', close(31.5 * gain, 33.33, 0.3), `31.5*${gain.toFixed(3)}=${(31.5 * gain).toFixed(1)}`);
+    for (let i = 0; i < 5000; i++) gain = autoCorrectGain(gain, 33.0);
+    check('33.0 RPM (dérive < 2%) -> corrigé vers 33.3', close(33.0 * gain, 33.33, 0.3), `33.0*${gain.toFixed(3)}=${(33.0 * gain).toFixed(1)}`);
 
     // b) 33.33 exact -> gain stable
     let g2 = 1.0;
     for (let i = 0; i < 5000; i++) g2 = autoCorrectGain(g2, 33.33);
     check('33.33 -> gain inchangé', close(g2, 1.0, 0.01), g2.toFixed(3));
 
-    // c) 45 RPM -> corrigé vers 45 (43 RPM = dans la bande ±6%)
+    // c) 44.5 RPM (dérive < 2% de 45) -> corrigé vers 45
     let g3 = 1.0;
-    for (let i = 0; i < 5000; i++) g3 = autoCorrectGain(g3, 43.0);
-    check('43 RPM -> corrigé vers 45', close(43 * g3, 45, 0.5), `${(43 * g3).toFixed(1)}`);
+    for (let i = 0; i < 5000; i++) g3 = autoCorrectGain(g3, 44.5);
+    check('44.5 RPM -> corrigé vers 45', close(44.5 * g3, 45, 0.3), `${(44.5 * g3).toFixed(1)}`);
+
+    // c2) PITCH : 34.5 RPM (pitch +3,5%) -> PAS touché (sensibilité au pitch)
+    let gP = 1.0;
+    for (let i = 0; i < 5000; i++) gP = autoCorrectGain(gP, 34.5);
+    check('pitch +3,5% (34.5) -> gain inchangé', close(gP, 1.0, 0.001), gP.toFixed(3));
 
     // d) 30 RPM (10% hors bande, décalage volontaire du DJ) -> PAS touché
     let g4 = 1.0;
@@ -341,8 +358,8 @@ try {
     const spin = (rpm) =>
       Array.from({ length: 40 }, () => ({ x: noise(0.01), y: noise(0.01), z: rad2rpm(rpm) + noise(0.05) }));
 
-    const g1 = estimateGainFromSamples(spin(31.5));
-    check('gyro lit 31.5 (platine à 33.33) -> gain ~1.058', close(g1, 33.33 / 31.5, 0.01), g1.toFixed(4));
+    const g1 = estimateGainFromSamples(spin(31.8));
+    check('gyro lit 31.8 (platine à 33.33) -> gain ~1.048', close(g1, 33.33 / 31.8, 0.01), g1.toFixed(4));
 
     const g2 = estimateGainFromSamples(spin(33.3));
     check('33.3 mesuré -> gain ~1.000', close(g2, 1, 0.01), g2.toFixed(4));
@@ -403,8 +420,10 @@ try {
     for (let i = 0; i < 50; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: RPM33 + noise(0.05) });
     for (let i = 0; i < 40; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: RPM33 + noise(0.05) }); // mesure
     for (let i = 0; i < 40; i++) samples.push({ x: noise(0.05), y: noise(0.05), z: noise(0.05) }); // arrêt
-    // la platine relâchée remonte de 0 à 33 en ~1 s (33 échantillons)
-    for (let i = 1; i <= 33; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: (RPM33 * i) / 33 + noise(0.05) });
+    // la platine relâchée remonte de 0 à 33 en ~1 s (33 échantillons).
+    // Rampe SANS bruit : la limite de bande doit rester déterministe
+    // (avec du bruit, le dernier échantillon peut tomber juste sous le seuil).
+    for (let i = 1; i <= 33; i++) samples.push({ x: 0, y: 0, z: (RPM33 * i) / 33 });
     const r = simulate(samples, bias);
     // la trace commence à l'échantillon 50 : 40 mesure (0-39), 40 arrêt (40-79),
     // remontée physique de la platine à partir de l'index 80 de la trace.
@@ -427,6 +446,34 @@ try {
   check('AXIS_CALIBRATION_MS = 1500 (1,5 s)', CALIBRATION_TIMINGS.AXIS_CALIBRATION_MS === 1500);
   check('RELOCK_MIN_RAD_S = 3.0 (~28,6 RPM)', RELOCK_MIN_RAD_S === 3.0);
   check('RELOCK_CONSECUTIVE = 3 échantillons', RELOCK_CONSECUTIVE === 3);
+  check('MOTION_SNAP_RPM = 25 (> wobble max ~18, < geste réel)', MOTION_SNAP_RPM === 25, `actuel: ${MOTION_SNAP_RPM}`);
+
+  // --- 7b. Motion snap : seuil cohérent avec le terrain ---
+  // Le wobble du rocking observé (ratio 0.79-1.54 = ±37% ≈ ±12 RPM de
+  // déviation sur le brut, jusqu'à ~18 RPM avec pics) ne doit PAS franchir
+  // MOTION_SNAP_RPM ; un vrai geste (backspin, scratch, poussée franche)
+  // le franchit largement.
+  console.log('\n[7b] Motion snap (seuil)');
+  {
+    // rotation stable bruyante : brut 21..45 RPM autour de 33 -> déviation
+    // max ~12-18 < 25 -> aucun snap
+    const bruts = [];
+    for (let i = 0; i < 300; i++) {
+      const t = i / 33.33;
+      const slip = 0.37 * Math.sin(2 * Math.PI * 0.4 * t);
+      bruts.push(33.33 * (1 + slip));
+    }
+    const maxDev = Math.max(...bruts.map((r) => Math.abs(r - 33.33)));
+    console.log(`     wobble max: brut ${Math.min(...bruts).toFixed(1)}..${Math.max(...bruts).toFixed(1)} (déviation max ${maxDev.toFixed(1)} RPM)`);
+    check('wobble ±37% : déviation max < 25 (pas de faux snap)', maxDev < MOTION_SNAP_RPM, `${maxDev.toFixed(1)} < ${MOTION_SNAP_RPM}`);
+    // backspin à -33 : le brut SIGNÉ passe à -33 pendant que l'estimé est
+    // encore à +33 -> écart signé = 66 >> 25 -> snap déclenché
+    check('backspin : écart signé brut/estimé >> 25 (snap)', 66 > MOTION_SNAP_RPM);
+    // poussée franche 33 -> 60 : écart 27 > 25 -> snap
+    check('poussée franche 33->60 : écart 27 > 25 (snap)', 27 > MOTION_SNAP_RPM);
+    // pitch léger 33 -> 36 : écart 3 < 25 -> la fenêtre suit (pas de snap)
+    check('pitch léger 33->36 : écart 3 < 25 (pas de snap)', 3 < MOTION_SNAP_RPM);
+  }
 
   // --- 8. Ré-accrochage STRICT après arrêt ---
   // L'utilisateur : "quand le plateau est arrêté, je bouge à peine et il me
@@ -481,10 +528,66 @@ try {
     }
   }
 
+  // --- 10. Estimateur de phase : stabilité + sensibilité au pitch ---
+  console.log('\n[10] Estimateur de phase (intégrale fenêtrée)');
+  {
+    const RPM33rad = RPM33; // 33.33 RPM en rad/s
+    // a) brut ±35% + pics aléatoires -> la sortie reste stable (33 ± 2)
+    {
+      const est = createPhaseEstimator({ windowMs: 3500, sampleMs: 50 });
+      let t = 0;
+      const out = [];
+      for (let i = 0; i < 300; i++) {
+        t += 50;
+        const wobble = 0.35 * Math.sin((2 * Math.PI * i) / 20); // ±35% à ~1 Hz
+        const spike = Math.random() < 0.02 ? (Math.random() * 2 - 1) * 1.0 : 0; // pics ±9,5 RPM
+        out.push(est.update(RPM33rad * (1 + wobble) + spike, t));
+      }
+      const last = out.slice(-60);
+      const min = Math.min(...last), max = Math.max(...last);
+      console.log(`     brut ±35% + pics -> sortie ${min.toFixed(1)}..${max.toFixed(1)} RPM`);
+      check('phase : brut ±35% -> stable (33 ± 2)', min > 31 && max < 35, `${min.toFixed(1)}..${max.toFixed(1)}`);
+    }
+    // b) PITCH 33.33 -> 36 : suivi en quelques secondes
+    {
+      const est = createPhaseEstimator({ windowMs: 3500, sampleMs: 50 });
+      let t = 0;
+      let reached = -1;
+      const DOT36 = 36 * (2 * Math.PI) / 60;
+      for (let i = 0; i < 240; i++) {
+        t += 50;
+        const v = est.update(i < 80 ? RPM33rad : DOT36, t);
+        if (reached < 0 && v > 34.5) reached = i;
+      }
+      const secs = ((reached * 50) / 1000).toFixed(1);
+      console.log(`     pitch 33.33->36 : 34.5 atteint en ${secs} s`);
+      check('phase : pitch suivi (34.5 atteint en <6,5 s)', reached >= 0 && reached * 50 / 1000 < 6.5, `${secs} s`);
+    }
+    // c) snapTo -> sortie immédiate
+    {
+      const est = createPhaseEstimator({ windowMs: 3500, sampleMs: 50 });
+      est.snapTo(20, 1000);
+      const v = est.update(RPM33rad, 1050);
+      check('phase : snapTo(20) -> ~20 immédiatement', close(v, 20, 1.0), v.toFixed(1));
+    }
+    // d) backspin signé -> négatif
+    {
+      const est = createPhaseEstimator({ windowMs: 3500, sampleMs: 50 });
+      let t = 0;
+      let v = 0;
+      for (let i = 0; i < 120; i++) {
+        t += 50;
+        v = est.update(-RPM33rad, t);
+      }
+      check('phase : backspin soutenu -> ~-33', v < -30, v.toFixed(1));
+    }
+  }
+
   // --- 9. Cadence adaptative de l'envoi (batterie) ---
   console.log('\n[9] Cadence adaptative (speedSender)');
   {
     check('SLOW_INTERVAL_MS = 5000 (5 s à l\'arrêt)', SLOW_INTERVAL_MS === 5000);
+    check('SEND_INTERVAL_MS = 30 (33 Hz en rotation)', SEND_INTERVAL_MS === 30, `actuel: ${SEND_INTERVAL_MS}`);
 
     // vers 127.0.0.1:9 (port fermé) : connexion refusée instantanément,
     // onError est appelé à chaque tick -> on compte les tentatives.

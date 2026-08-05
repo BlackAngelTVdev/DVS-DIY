@@ -45,8 +45,11 @@ dernier_ratio_logue = None
 
 # Lissage du ratio côté serveur : le module est lissé (anti à-coups de
 # pitch), le SIGNE reste instantané (backspin/scratch réactifs).
-# alpha 0.1 à ~10 requêtes/s -> constante de temps ~1 s.
-LISSAGE_ALPHA = 0.1
+# L'app envoie maintenant à ~33 Hz (30 ms), fait le gros du lissage
+# (estimateur de phase + motion snap) et lui envoie DÉJÀ une vitesse
+# stable ET réactive : le serveur n'a plus besoin d'une constante de
+# temps lente. alpha 0.3 à ~33 requêtes/s -> constante de temps ~100 ms.
+LISSAGE_ALPHA = 0.3
 module_lisse = 0.0
 
 # --- 1. CHARGEMENT DU FICHIER AUDIO ---
@@ -222,7 +225,10 @@ thread_check.start()
 
 # --- 8. BOUCLE PRINCIPALE ---
 try:
-    with sd.OutputStream(channels=2, callback=audio_callback, samplerate=SAMPLING_RATE, blocksize=1024, device=DEVICE_AUDIO):
+    # blocksize 512 + latency 'low' : latence audio réduite (~12 ms par bloc
+    # au lieu de ~23 ms). Si tu entends des crachotements (underruns) sur ton
+    # DAC, repasse à blocksize=1024 / latency=None.
+    with sd.OutputStream(channels=2, callback=audio_callback, samplerate=SAMPLING_RATE, blocksize=512, latency='low', device=DEVICE_AUDIO):
         print(f"\n=========================================")
         print(f"===         SERVEUR DVS REKORDBOX       ===")
         print(f"=========================================")
