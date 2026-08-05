@@ -20,6 +20,7 @@ import {
   detectRelease,
   relockStep,
   MOTION_SNAP_RPM,
+  MOTION_SNAP_CONSECUTIVE,
   ESTIMATOR_WINDOW_MS,
   ESTIMATOR_FAST_WINDOW_MS,
   ESTIMATOR_FAST_HOLD_MS,
@@ -27,6 +28,7 @@ import {
   SLOW_STOP_MS,
   RELOCK_CONSECUTIVE,
   STOPPED_RAD_S,
+  STOPPED_MS,
   ZERO_DEADBAND_RAD_S,
   CALIBRATION_TIMINGS,
 } from './calibration';
@@ -112,7 +114,9 @@ export function useRpmSensor() {
   const restBiasSamplesRef = useRef([]);        // échantillons à l'arrêt -> re-calibration du biais
   const restBiasStartRef = useRef(null);        // instant du 1er échantillon d'immobilité (durée, pas comptage)
   const fastSpeedTrackerRef = useRef(null);     // suivi rapide pour détecter les arrêts brutaux
+  const motionSnapCountRef = useRef(0);         // compteur du motion snap (2 échantillons requis : filtre anti-impulsion)
   const stopCandidateStartRef = useRef(null);   // instant du 1er échantillon sous le seuil d'arrêt
+  const stoppedStartRef = useRef(null);         // instant du 1er échantillon SOUTENU sous STOPPED_RAD_S
   const slowStopStartRef = useRef(null);        // instant du 1er échantillon sous l'écart d'arrêt anticipé
   const lastLogTimeRef = useRef(0);             // pour limiter la fréquence des logs
   const standardSpeedRef = useRef(33.33);       // miroir de standardSpeed pour le callback gyro
@@ -231,7 +235,9 @@ export function useRpmSensor() {
     restBiasSamplesRef.current = [];
     restBiasStartRef.current = null;
     fastSpeedTrackerRef.current = null;
+    motionSnapCountRef.current = 0;
     stopCandidateStartRef.current = null;
+    stoppedStartRef.current = null;
     slowStopStartRef.current = null;
     setRpm(0);
     rpmRef.current = 0;
@@ -426,18 +432,27 @@ export function useRpmSensor() {
           console.log('[RPM] Vrai mouvement détecté -> ré-accrochage direct');
         }
       } else if (absSpeed < STOPPED_RAD_S) {
-        // on retombe vraiment à l'arrêt : on recolle à 0 et on se remet en
-        // attente d'un vrai geste pour repartir
-        wasStoppedRef.current = true;
-        relockCountRef.current = 0;
-        phaseRef.current.snapTo(0, now);
-        stableOutRef.current.snapTo(0);
-        useFastWindow(now);   // retour à 0 visible immédiatement
-        releaseArmedRef.current = true; // un vrai arrêt arme le relâchement
-        setRpm(0);
-        rpmRef.current = 0;
-        setSendCadence(false); // économie batterie à l'arrêt
-        setGyroRate(false);    // et gyro à 20 Hz
+        // Arrêt DOUX : doit être SOUTENU (~120 ms). Un flip de scratch traverse
+        // brièvement cette zone en remontant vers ±33 -> il ne doit PAS mettre
+        // wasStopped (sinon chaque passage par zéro couperait le son et le
+        // scratch serait bloqué à 0.0). On ne déclare l'arrêt que si la vitesse
+        // reste réellement sous le seuil pendant STOPPED_MS.
+        if (stoppedStartRef.current === null) stoppedStartRef.current = now;
+        if (now - stoppedStartRef.current >= STOPPED_MS) {
+          stoppedStartRef.current = null;
+          wasStoppedRef.current = true;
+          relockCountRef.current = 0;
+          phaseRef.current.snapTo(0, now);
+          stableOutRef.current.snapTo(0);
+          useFastWindow(now);   // retour à 0 visible immédiatement
+          releaseArmedRef.current = true; // un vrai arrêt arme le relâchement
+          setRpm(0);
+          rpmRef.current = 0;
+          setSendCadence(false); // économie batterie à l'arrêt
+          setGyroRate(false);    // et gyro à 20 Hz
+        }
+      } else {
+        stoppedStartRef.current = null;
       }
 
       const direction = absSpeed < ZERO_DEADBAND_RAD_S ? 0 : dot >= 0 ? 1 : -1;
@@ -452,21 +467,31 @@ export function useRpmSensor() {
 
       // --- MOTION SNAP : la magnitude suit la main pendant un VRAI geste ---
       // Pendant un scratch/backspin, la vitesse axiale SENTIE change de sens
-      // instantanément, mais la fenêtre (3,5 s) met ~2 s à traverser zéro :
+      // instantanément, mais la fenêtre (5 s) met ~2 s à traverser zéro :
       // le son "traîne" derrière la main. Si la vitesse brute SIGNÉE s'écarte
-      // de l'estimé de plus de MOTION_SNAP_RPM (le wobble max ~±18 RPM ne
+      // de l'estimé de plus de MOTION_SNAP_RPM (le wobble max ~±12-15 RPM ne
       // peut pas l'atteindre, un geste réel si), on colle l'estimateur au
       // suivi rapide -> la magnitude répond en ~50 ms. Signe et magnitude
       // suivent donc tous les deux la main immédiatement.
       const rawRpmSigned = (dot >= 0 ? 1 : -1) * absSpeed * (60 / (2 * Math.PI));
       let rpmBrut = axialRpm;
       if (!wasStoppedRef.current && Math.abs(rawRpmSigned - estRpm) > MOTION_SNAP_RPM) {
-        const fastSigned =
-          (fastSpeedTrackerRef.current ?? absSpeed) * (60 / (2 * Math.PI)) * (dot >= 0 ? 1 : -1);
-        phaseRef.current.snapTo(fastSigned, now);
-        stableOutRef.current.snapTo(fastSigned); // la main suit immédiatement (scratch)
-        useFastWindow(now);   // la magnitude suit la main immédiatement
-        rpmBrut = Math.abs(fastSigned);
+        // 2 échantillons CONSÉCUTIFS requis (MOTION_SNAP_CONSECUTIVE) : une
+        // impulsion de bruit isolée qui dépasserait brièvement 20 RPM ne doit
+        // pas injecter le wobble dans la sortie lissée (faux snap -> saut au
+        // pic du wobble). Un geste réel dure des dizaines de ms -> toujours ok.
+        motionSnapCountRef.current += 1;
+        if (motionSnapCountRef.current >= MOTION_SNAP_CONSECUTIVE) {
+          motionSnapCountRef.current = 0;
+          const fastSigned =
+            (fastSpeedTrackerRef.current ?? absSpeed) * (60 / (2 * Math.PI)) * (dot >= 0 ? 1 : -1);
+          phaseRef.current.snapTo(fastSigned, now);
+          stableOutRef.current.snapTo(fastSigned); // la main suit immédiatement (scratch)
+          useFastWindow(now);   // la magnitude suit la main immédiatement
+          rpmBrut = Math.abs(fastSigned);
+        }
+      } else {
+        motionSnapCountRef.current = 0;
       }
 
       // --- Snap d'ARRÊT ANTICIPÉ (décélération douce) ---

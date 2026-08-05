@@ -475,10 +475,16 @@ export function detectRelease(smoothedRpm, rawRpm, band = RELEASE_BAND, target =
 // s'écarte de l'estimé fenêtré de plus de ce seuil, c'est un geste réel :
 // le hook colle l'estimateur au suivi rapide pour que la magnitude suive la
 // main en ~50-100 ms au lieu de ~2 s.
-// Le wobble du rocking (déviation max ~±18 RPM observée sur les logs réels
-// ratio 0.79-1.54) ne peut PAS franchir 25 RPM -> aucune fausse détection
-// en rotation stable.
-export const MOTION_SNAP_RPM = 25;
+// Le wobble du rocking (déviation max ~±12 RPM sur les logs réels, pics à
+// ~15 avec l'harmonique 1,7 Hz) ne peut PAS franchir 20 RPM -> aucune fausse
+// détection en rotation stable, ET un geste MODÉRÉ (poussée à ~54 RPM,
+// décélération franche) franchit le seuil et suit la main immédiatement.
+export const MOTION_SNAP_RPM = 20;
+// Le snap exige 2 échantillons CONSÉCUTIFS (20 ms à 100 Hz) : une impulsion
+// de bruit isolée qui dépasserait brièvement 20 RPM ne doit pas injecter le
+// wobble dans la sortie lissée (un faux snap ferait sauter l'affichage au
+// pic du wobble). Un geste réel dure des dizaines de ms -> toujours déclenché.
+export const MOTION_SNAP_CONSECUTIVE = 2;
 
 // --- Ré-accrochage après arrêt : il faut un VRAI geste ---
 // Le ré-accrochage (relock) après un arrêt se déclenche quand la platine
@@ -497,6 +503,14 @@ export const RELOCK_CONSECUTIVE = 5; // 5 échantillons consécutifs au-dessus d
 // Sous cette vitesse (~9,5 RPM) on considère la platine comme (quasi) à
 // l'arrêt : on recolle à 0 et on attend un vrai geste pour repartir.
 export const STOPPED_RAD_S = 1.0;
+// Durée SOUTENUE sous STOPPED_RAD_S requise pour déclarer un arrêt doux.
+// CRUCIAL pour le scratch : à chaque flip (passage par zéro avant/arrière),
+// la vitesse traverse la zone < 9,5 RPM pendant ~30-60 ms en remontant vers
+// ±33. Sans cette durée, UN SEUL échantillon sous le seuil mettait wasStopped
+// -> le scratch était bloqué à 0.0 en permanence (gyro 20 Hz + envoi 5 s +
+// 50 ms de relock à chaque flip). Un vrai arrêt, lui, reste sous le seuil
+// pendant des centaines de ms -> toujours déclaré.
+export const STOPPED_MS = 120;
 
 /**
  * Fonction pure du compteur de ré-accrochage : incrémente quand la vitesse

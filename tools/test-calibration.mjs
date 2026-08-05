@@ -25,6 +25,8 @@ const {
   detectRelease,
   relockStep,
   MOTION_SNAP_RPM,
+  MOTION_SNAP_CONSECUTIVE,
+  STOPPED_MS,
   ESTIMATOR_WINDOW_MS,
   ESTIMATOR_FAST_WINDOW_MS,
   ESTIMATOR_FAST_HOLD_MS,
@@ -111,6 +113,7 @@ try {
     let releaseAway = false, releaseCount = 0, nearPrev = false;
     let releaseArmed = false; // relâchement armé seulement après un VRAI arrêt
     let wasStopped = true, relockCount = 0; // ré-accrochage strict (comme le hook)
+    let softStopCount = 0; // arrêt doux SOUTENU (les flips de scratch n'y comptent pas)
     const gain = 1.0;
     const trace = [];
     for (const s of corrected.slice(50)) {
@@ -144,10 +147,21 @@ try {
           wasStopped = false;
         }
       } else if (absSpeed < 1.0) {
-        wasStopped = true;
-        relockCount = 0;
-        estimator.snapTo(0, t);
-        releaseArmed = true;
+        // Arrêt DOUX SOUTENU (~120 ms = Math.ceil(STOPPED_MS/50) échantillons
+        // à 50 ms) : un flip de scratch (1 échantillon sous le seuil, ~50 ms)
+        // ne doit PAS mettre wasStopped, sinon le scratch est bloqué à 0.0 en
+        // permanence (le bug utilisateur "toujours à 0.0"). Un vrai arrêt
+        // (des centaines de ms sous le seuil) déclenche toujours.
+        softStopCount += 1;
+        if (softStopCount >= Math.ceil(STOPPED_MS / 50)) {
+          softStopCount = 0;
+          wasStopped = true;
+          relockCount = 0;
+          estimator.snapTo(0, t);
+          releaseArmed = true;
+        }
+      } else {
+        softStopCount = 0;
       }
       const direction = absSpeed < ZERO_DEADBAND_RAD_S ? 0 : dot >= 0 ? 1 : -1;
       let module = Math.abs(estimator.update(dot, t));
@@ -482,7 +496,9 @@ try {
   check('AXIS_CALIBRATION_MS = 1500 (1,5 s)', CALIBRATION_TIMINGS.AXIS_CALIBRATION_MS === 1500);
   check('RELOCK_MIN_RAD_S = 2.0 (~19,1 RPM, backspin moyen ré-accroche)', RELOCK_MIN_RAD_S === 2.0, `actuel: ${RELOCK_MIN_RAD_S}`);
   check('RELOCK_CONSECUTIVE = 5 échantillons (~50 ms, filtre micro-geste)', RELOCK_CONSECUTIVE === 5, `actuel: ${RELOCK_CONSECUTIVE}`);
-  check('MOTION_SNAP_RPM = 25 (> wobble max ~18, < geste réel)', MOTION_SNAP_RPM === 25, `actuel: ${MOTION_SNAP_RPM}`);
+  check('MOTION_SNAP_RPM = 20 (> wobble max ~12-15, < geste modéré)', MOTION_SNAP_RPM === 20, `actuel: ${MOTION_SNAP_RPM}`);
+  check('MOTION_SNAP_CONSECUTIVE = 2 (filtre les impulsions de bruit > 20)', MOTION_SNAP_CONSECUTIVE === 2, `actuel: ${MOTION_SNAP_CONSECUTIVE}`);
+  check('STOPPED_MS = 120 (flip de scratch < 120 ms, arrêt réel > 120 ms)', STOPPED_MS === 120, `actuel: ${STOPPED_MS}`);
   check('SLOW_STOP_GAP_RPM = 20 (> wobble max ~15,5, < décélération réelle)', SLOW_STOP_GAP_RPM === 20, `actuel: ${SLOW_STOP_GAP_RPM}`);
 
   // Le snap d'arrêt anticipé se base sur l'écart (estimé - brut) : sur le wobble
@@ -521,13 +537,13 @@ try {
 
   // --- 7b. Motion snap : seuil cohérent avec le terrain ---
   // Le wobble du rocking observé (ratio 0.79-1.54 = ±37% ≈ ±12 RPM de
-  // déviation sur le brut, jusqu'à ~18 RPM avec pics) ne doit PAS franchir
-  // MOTION_SNAP_RPM ; un vrai geste (backspin, scratch, poussée franche)
-  // le franchit largement.
+  // déviation sur le brut, pics ~15 avec l'harmonique 1,7 Hz) ne doit PAS
+  // franchir MOTION_SNAP_RPM ; un geste MODÉRÉ (poussée, backspin lent) le
+  // franchit largement.
   console.log('\n[7b] Motion snap (seuil)');
   {
     // rotation stable bruyante : brut 21..45 RPM autour de 33 -> déviation
-    // max ~12-18 < 25 -> aucun snap
+    // max ~12 < 20 -> aucun snap
     const bruts = [];
     for (let i = 0; i < 300; i++) {
       const t = i / 33.33;
@@ -536,14 +552,16 @@ try {
     }
     const maxDev = Math.max(...bruts.map((r) => Math.abs(r - 33.33)));
     console.log(`     wobble max: brut ${Math.min(...bruts).toFixed(1)}..${Math.max(...bruts).toFixed(1)} (déviation max ${maxDev.toFixed(1)} RPM)`);
-    check('wobble ±37% : déviation max < 25 (pas de faux snap)', maxDev < MOTION_SNAP_RPM, `${maxDev.toFixed(1)} < ${MOTION_SNAP_RPM}`);
+    check('wobble ±37% : déviation max < 20 (pas de faux snap)', maxDev < MOTION_SNAP_RPM, `${maxDev.toFixed(1)} < ${MOTION_SNAP_RPM}`);
     // backspin à -33 : le brut SIGNÉ passe à -33 pendant que l'estimé est
-    // encore à +33 -> écart signé = 66 >> 25 -> snap déclenché
-    check('backspin : écart signé brut/estimé >> 25 (snap)', 66 > MOTION_SNAP_RPM);
-    // poussée franche 33 -> 60 : écart 27 > 25 -> snap
-    check('poussée franche 33->60 : écart 27 > 25 (snap)', 27 > MOTION_SNAP_RPM);
-    // pitch léger 33 -> 36 : écart 3 < 25 -> la fenêtre suit (pas de snap)
-    check('pitch léger 33->36 : écart 3 < 25 (pas de snap)', 3 < MOTION_SNAP_RPM);
+    // encore à +33 -> écart signé = 66 >> 20 -> snap déclenché
+    check('backspin : écart signé brut/estimé >> 20 (snap)', 66 > MOTION_SNAP_RPM);
+    // poussée MODÉRÉE 33 -> 54 : écart 21 > 20 -> snap (amélioration : avant 25)
+    check('poussée modérée 33->54 : écart 21 > 20 (snap)', 21 > MOTION_SNAP_RPM);
+    // poussée franche 33 -> 60 : écart 27 > 20 -> snap
+    check('poussée franche 33->60 : écart 27 > 20 (snap)', 27 > MOTION_SNAP_RPM);
+    // pitch léger 33 -> 36 : écart 3 < 20 -> la fenêtre suit (pas de snap)
+    check('pitch léger 33->36 : écart 3 < 20 (pas de snap)', 3 < MOTION_SNAP_RPM);
   }
 
   // --- 8. Ré-accrochage STRICT après arrêt ---
@@ -597,6 +615,58 @@ try {
       console.log(`     vrai scratch : premier échantillon > 25 RPM à l'index ${firstHigh}`);
       check('vrai scratch : accroche en <4 échantillons après le début du geste', firstHigh >= 70 && firstHigh <= 73, `index ${firstHigh}`);
       check('vrai scratch : valeur finale ~33.3', close(end, 33.33, 1.5), end.toFixed(1));
+    }
+  }
+
+  // --- 8b. Scratch : les passages par zéro ne bloquent PAS à 0.0 ---
+  // LE BUG UTILISATEUR : "le scratch pas possible, il est toujours à 0.0".
+  // À chaque flip (changement avant/arrière), la vitesse traverse la zone
+  // < 1 rad/s (~9,5 RPM) pendant ~50 ms. L'ANCIEN arrêt doux était INSTANTANÉ
+  // (1 seul échantillon sous le seuil -> wasStopped) -> le scratch se bloquait
+  // à 0.0 en permanence (gyro repassé à 20 Hz + envoi à 5 s + 50 ms de relock
+  // à chaque flip). Désormais l'arrêt doux exige ~120 ms SOUTENUS : un flip
+  // (~50 ms) ne déclenche rien, un vrai arrêt (des centaines de ms) oui.
+  console.log('\n[8b] Scratch : flips rapides ne bloquent pas à 0.0');
+  {
+    const bias = { x: 0, y: 0, z: 0 };
+    const samples = [];
+    for (let i = 0; i < 50; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: RPM33 + noise(0.05) }); // axe
+    for (let i = 0; i < 60; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: RPM33 + noise(0.05) }); // mesure
+    // scratch : 8 cycles de 6 échantillons à ±33 + 1 échantillon à ~0,3 rad/s
+    // (passage par zéro brutal, ~50 ms à 20 Hz / ~10 ms à 100 Hz : bien sous
+    // les 120 ms exigés pour déclarer un arrêt doux)
+    const flips = [];
+    for (let f = 0; f < 8; f++) {
+      const dir = f % 2 === 0 ? 1 : -1; // alterne avant/arrière
+      for (let i = 0; i < 6; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: dir * RPM33 + noise(0.05) });
+      samples.push({ x: noise(0.02), y: noise(0.02), z: 0.3 + noise(0.05) }); // flip : ~0,3 rad/s (< 1.0)
+      // index TRACE du flip = index échantillon - 50 (les 50 premiers servent à l'axe)
+      flips.push(samples.length - 1 - 50);
+    }
+    const r = simulate(samples, bias);
+    if (r) {
+      // après CHAQUE flip, l'échantillon suivant doit suivre la nouvelle
+      // direction (jamais bloqué à 0) : l'ancien bug collait ~0 à chaque flip.
+      // (le dernier flip est le dernier échantillon : rien après lui -> on ne
+      // vérifie que les 7 premiers, qui ont un échantillon suivant)
+      let stuck = 0;
+      for (let k = 0; k < flips.length - 1; k++) {
+        const v = r.trace[flips[k] + 1];
+        const expectedSign = k % 2 === 0 ? -1 : 1; // 1er flip -> arrière, puis alterne
+        if (Math.abs(v) < 3 || (v > 0) !== (expectedSign > 0)) stuck++;
+      }
+      const afterFlip1 = r.trace[flips[0] + 1];
+      check('scratch : 1er flip suivi (~-33, pas 0)', close(afterFlip1, -33.33, 8.0), afterFlip1.toFixed(1));
+      check('scratch : aucun flip bloqué à 0 (7/7 suivis)', stuck === 0, `${stuck}/7 bloqués`);
+      // l'arrêt doux DOIT toujours fonctionner sur un VRAI arrêt : le DJ tient
+      // le disque à ~5,7 RPM (0,6 rad/s — SOUS le seuil d'arrêt 1.0 rad/s,
+      // MAIS au-dessus du déclencheur d'arrêt brutal qui exige <10% du suivi
+      // rapide) pendant >120 ms -> la sortie doit retomber à 0 via le chemin
+      // d'arrêt doux (ce scénario teste EXACTEMENT la logique à durée soutenue,
+      // pas l'arrêt brutal).
+      for (let i = 0; i < 6; i++) samples.push({ x: 0, y: 0, z: 0.6 });
+      const r2 = simulate(samples, bias);
+      check('scratch : un VRAI arrêt (tenu à ~5 RPM) retombe à 0', r2 && close(r2.trace[r2.trace.length - 1], 0, 1.5), r2?.trace[r2.trace.length - 1].toFixed(2));
     }
   }
 
