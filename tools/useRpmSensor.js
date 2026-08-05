@@ -14,6 +14,7 @@ import {
   computeMagnitude,
   detectRotationAxis,
   createPhaseEstimator,
+  createStableOutput,
   autoCorrectGain,
   estimateGainFromSamples,
   detectRelease,
@@ -98,7 +99,8 @@ export function useRpmSensor() {
   const axisVectorRef = useRef(null); // vecteur unitaire de l'axe calibré (null = pas encore détecté)
 
   const rejectedRef = useRef(0);
-  const phaseRef = useRef(createPhaseEstimator()); // intègre la vitesse axiale (fenêtre 3,5 s)
+  const phaseRef = useRef(createPhaseEstimator()); // intègre la vitesse axiale (fenêtre 5 s)
+  const stableOutRef = useRef(createStableOutput()); // lisseur de SORTIE (stabilité de fou)
   const gainRef = useRef(1);                    // recalage auto de la vitesse (vers 33/45/78)
   const releaseAwayRef = useRef(false);         // état "loin d'une standard" SOUTENU
   const releaseCountRef = useRef(0);            // compteur d'échantillons away consécutifs
@@ -233,6 +235,7 @@ export function useRpmSensor() {
     slowStopStartRef.current = null;
     setRpm(0);
     rpmRef.current = 0;
+    stableOutRef.current.reset();
     stabilityRingRef.current = [];
     setStability(0);
 
@@ -363,6 +366,7 @@ export function useRpmSensor() {
         if (now - stopCandidateStartRef.current >= STOP_DETECTION_MS) {
           stopCandidateStartRef.current = null;
           phaseRef.current.snapTo(0, now);
+          stableOutRef.current.snapTo(0); // sortie à 0 IMMÉDIAT (pas de lissage)
           useFastWindow(now);   // la valeur affichée revient à ~0 immédiatement
           releaseArmedRef.current = true; // un vrai arrêt arme le relâchement
           fastSpeedTrackerRef.current = 0;
@@ -408,9 +412,12 @@ export function useRpmSensor() {
         if (absSpeed >= 1.0) setGyroRate(true);
         relockCountRef.current = relockStep(relockCountRef.current, absSpeed);
         phaseRef.current.snapTo(0, now);
+        stableOutRef.current.snapTo(0);
         rpmRef.current = 0;
         if (relockCountRef.current >= RELOCK_CONSECUTIVE) {
-          phaseRef.current.snapTo(absSpeed * (60 / (2 * Math.PI)), now);
+          const relockSpeed = absSpeed * (60 / (2 * Math.PI));
+          phaseRef.current.snapTo(relockSpeed, now);
+          stableOutRef.current.snapTo(relockSpeed); // colle à la vitesse du geste
           useFastWindow(now);   // la valeur affichée remonte à 33 quasi tout de suite
           relockCountRef.current = 0;
           wasStoppedRef.current = false;
@@ -424,6 +431,7 @@ export function useRpmSensor() {
         wasStoppedRef.current = true;
         relockCountRef.current = 0;
         phaseRef.current.snapTo(0, now);
+        stableOutRef.current.snapTo(0);
         useFastWindow(now);   // retour à 0 visible immédiatement
         releaseArmedRef.current = true; // un vrai arrêt arme le relâchement
         setRpm(0);
@@ -456,6 +464,7 @@ export function useRpmSensor() {
         const fastSigned =
           (fastSpeedTrackerRef.current ?? absSpeed) * (60 / (2 * Math.PI)) * (dot >= 0 ? 1 : -1);
         phaseRef.current.snapTo(fastSigned, now);
+        stableOutRef.current.snapTo(fastSigned); // la main suit immédiatement (scratch)
         useFastWindow(now);   // la magnitude suit la main immédiatement
         rpmBrut = Math.abs(fastSigned);
       }
@@ -476,6 +485,7 @@ export function useRpmSensor() {
           const fastSigned =
             (fastSpeedTrackerRef.current ?? absSpeed) * (60 / (2 * Math.PI)) * (dot >= 0 ? 1 : -1);
           phaseRef.current.snapTo(fastSigned, now);
+          stableOutRef.current.snapTo(fastSigned); // décélération suivie en temps réel
           useFastWindow(now);
           rpmBrut = Math.abs(fastSigned);
         }
@@ -505,6 +515,7 @@ export function useRpmSensor() {
         // ça, un 33 stable mais bruyant déclencherait des snaps en boucle.
         releaseArmedRef.current = false;
         phaseRef.current.snapTo(sel / gainRef.current, now);
+        stableOutRef.current.snapTo(sel / gainRef.current); // collé à la standard
         useFastWindow(now);   // accroché à la standard immédiatement
         rpmBrut = sel / gainRef.current;
         setSendCadence(true);
@@ -523,12 +534,17 @@ export function useRpmSensor() {
       releaseNearPrevRef.current = near;
 
       const rpmSigne = direction * rpmBrut * gainRef.current;
-      rpmRef.current = rpmSigne;
+      // Lisseur de SORTIE : la valeur envoyée au Pi doit être quasi constante
+      // en rotation stable (Rekordbox figé à 0 pitch) tout en suivant la main
+      // instantanément (les snaps ci-dessus ont déjà forcé stableOut à la
+      // bonne valeur ; en régime stable la sortie est figée par la bande morte).
+      const rpmFinal = stableOutRef.current.update(rpmSigne);
+      rpmRef.current = rpmFinal;
       // Throttle UI : on ne re-rend que ~12 fois/s, pas à chaque échantillon
       // gyro (batterie/CPU). Le sender lit rpmRef, lui, à chaque échantillon.
       if (now - lastUiUpdateRef.current >= UI_UPDATE_INTERVAL_MS) {
         lastUiUpdateRef.current = now;
-        setRpm(rpmSigne);
+        setRpm(rpmFinal);
       }
 
       // Logs limités à ~2 par seconde (le gyro émet toutes les 30ms)

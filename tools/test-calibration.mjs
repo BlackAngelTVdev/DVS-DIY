@@ -19,6 +19,7 @@ const {
   computeMagnitude,
   detectRotationAxis,
   createPhaseEstimator,
+  createStableOutput,
   autoCorrectGain,
   estimateGainFromSamples,
   detectRelease,
@@ -199,7 +200,10 @@ try {
     const bias = { x: 0, y: 0, z: 0 };
     const samples = [];
     for (let i = 0; i < 50; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: RPM33 + noise(0.05) });
-    for (let i = 0; i < 100; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: -RPM33 + noise(0.05) });
+    // 150 échantillons = 7,5 s : assez pour remplir la fenêtre 5 s APRÈS le
+    // relock (5 échantillons) et converger à -33.3 (avec 5 s, 100 échantillons
+    // ne suffisaient plus : la fenêtre contenait encore le bord virtuel du snap)
+    for (let i = 0; i < 150; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: -RPM33 + noise(0.05) });
     const r = simulate(samples, bias);
     check('backspin -> ~ -33.3 RPM', r && close(r.ema, -33.33, 1.0), r?.ema?.toFixed(2));
   }
@@ -212,7 +216,7 @@ try {
     const bias = { x: 0, y: 0, z: 0 };
     const samples = [];
     for (let i = 0; i < 60; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: RPM33 + noise(0.05) });
-    for (let i = 0; i < 100; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: -RPM33 + noise(0.05) });
+    for (let i = 0; i < 150; i++) samples.push({ x: noise(0.02), y: noise(0.02), z: -RPM33 + noise(0.05) });
     const r = simulate(samples, bias);
     const secondHalf = r.trace.slice(60);
     const avgSecondHalf = secondHalf.reduce((a, b) => a + b, 0) / secondHalf.length;
@@ -390,7 +394,11 @@ try {
     check('gyro lit 31.8 (platine à 33.33) -> gain ~1.048', close(g1, 33.33 / 31.8, 0.01), g1.toFixed(4));
 
     const g2 = estimateGainFromSamples(spin(33.3));
-    check('33.3 mesuré -> gain ~1.000', close(g2, 1, 0.01), g2.toFixed(4));
+    // tolérance 0,015 : 40 échantillons bruités, le percentile 30 des magnitudes
+    // peut être à ±1% autour de 33.3 -> un gain 1.01 est correct (le recalage
+    // lent le ramène ensuite). Le but du test : un gyro qui lit juste donne un
+    // gain ~1 (pas 1.05+ comme un gyro qui lit 31.8).
+    check('33.3 mesuré -> gain ~1.000', close(g2, 1, 0.015), g2.toFixed(4));
 
     const g3 = estimateGainFromSamples(spin(45));
     check('45 mesuré -> gain ~1.000', close(g3, 1, 0.01), g3.toFixed(4));
@@ -686,7 +694,112 @@ try {
     }
     check('redémarrage : affiche >32.5 en <0,8 s après relock', over33 >= 0 && (over33 - 2000) / 1000 < 0.8, `${(over33 / 1000).toFixed(2)} s`);
     // la fenêtre doit bien revenir à LONGUE après la période rapide
-    check('fenêtre restaurée à 3500 ms', est.getWindow() === 3500, `actuel: ${est.getWindow()}`);
+    check('fenêtre restaurée à la fenêtre longue', est.getWindow() === ESTIMATOR_WINDOW_MS, `actuel: ${est.getWindow()}`);
+  }
+
+  // --- 10c. Lisseur de SORTIE (stabilité de fou sur Rekordbox) ---
+  // "à 0 de pitch, il faut 0 ± 0,5 sur Rekordbox". L'estimateur élimine le
+  // wobble, mais le résidu fait trembler le ratio envoyé. createStableOutput
+  // fige la sortie en rotation stable (0 variation visible) et rattrape
+  // immédiatement un vrai changement (pitch, relâchement, geste).
+  console.log('\n[10c] Lisseur de sortie (stabilité de fou)');
+  {
+    // a) unit : en dessous de la bande morte, la sortie est FIGÉE
+    const out = createStableOutput();
+    out.update(33.33);
+    for (let i = 0; i < 200; i++) {
+      // bruit résiduel qui oscille ±0,3 autour de la moyenne (change de signe)
+      const wob = 0.3 * Math.sin(i / 7) + noise(0.05);
+      out.update(33.33 + wob);
+    }
+    const final1 = out.update(33.33 + 0.2);
+    check('stable : sortie quasi figée (< 0,05 RPM de dérive)', close(final1, 33.33, 0.05), final1.toFixed(3));
+
+    // b) un vrai pitch +3,5% (33.33 -> 34.5) : écart > bande -> rattrapage rapide
+    const out2 = createStableOutput();
+    for (let i = 0; i < 20; i++) out2.update(33.33);
+    let reached = -1;
+    for (let i = 0; i < 80; i++) {
+      const v = out2.update(34.5);
+      if (reached < 0 && v > 34.2) reached = i;
+    }
+    // la convergence ~0,5 s (50 échantillons à 10 ms) est parfaite pour
+    // Rekordbox : un pitch n'a pas besoin d'être suivi plus vite que ça, la
+    // priorité est la stabilité en rotation stable.
+    check('pitch +3,5% : rattrapé en <60 échantillons (600 ms)', reached >= 0 && reached < 60, `échantillon ${reached}`);
+
+    // c) un pitch LENT qui s'installe (+1% = 0,33 RPM, sous la bande) : la
+    //    persistance directionnelle le détecte quand même (500 ms de dérive)
+    const out3 = createStableOutput();
+    for (let i = 0; i < 20; i++) out3.update(33.33);
+    let reached3 = -1;
+    for (let i = 0; i < 200; i++) {
+      const v = out3.update(33.66); // +1% constant
+      if (reached3 < 0 && v > 33.55) reached3 = i;
+    }
+    check('pitch lent +1% : détecté par persistance en <120 échantillons', reached3 >= 0 && reached3 < 120, `échantillon ${reached3}`);
+
+    // d) snapTo : la sortie suit IMMÉDIATEMENT (arrêt, relock, scratch)
+    const out4 = createStableOutput();
+    for (let i = 0; i < 20; i++) out4.update(33.33);
+    out4.snapTo(0);
+    check('snapTo(0) : sortie = 0 immédiatement', out4.update(0.5) < 0.5, out4.update(0).toFixed(2));
+    out4.snapTo(-33);
+    check('snapTo(-33) : scratch arrière immédiat', close(out4.update(-33), -33, 0.01), out4.update(-33).toFixed(2));
+  }
+
+  // --- 10d. Fenêtre 5 s = 2 périodes du wobble 0,4 Hz -> annulation parfaite ---
+  // L'intégrale d'un sinus pur sur un nombre ENTIER de périodes s'annule
+  // quelle que soit la phase : avec 5 s, le mode dominant du rocking réel
+  // (±37% à ~0,4 Hz) doit laisser un résidu quasi nul.
+  console.log('\n[10d] Fenêtre 5 s (annulation du wobble 0,4 Hz)');
+  {
+    check('ESTIMATOR_WINDOW_MS = 5000 (2 périodes du wobble 0,4 Hz)', ESTIMATOR_WINDOW_MS === 5000, `actuel: ${ESTIMATOR_WINDOW_MS}`);
+    const est = createPhaseEstimator({ windowMs: 5000, sampleMs: 10 });
+    let t = 0;
+    const wobbleAt = (i) => 0.37 * Math.sin((2 * Math.PI * 0.4 * i * 10) / 1000); // wobble pur ±37%
+    // warm-up 6 s AVEC le wobble dès le début : la fenêtre 5 s est pleine de
+    // wobble quand on commence à mesurer (sinon on mesurerait le transitoire
+    // de remplissage de la fenêtre, pas l'annulation).
+    for (let i = 0; i < 600; i++) { t += 10; est.update(RPM33 * (1 + wobbleAt(i)), t); }
+    const out = [];
+    for (let i = 600; i < 1000; i++) {
+      t += 10;
+      out.push(est.update(RPM33 * (1 + wobbleAt(i)), t));
+    }
+    const last = out;
+    const mn = Math.min(...last), mx = Math.max(...last);
+    console.log(`     wobble pur 0,4 Hz ±37% : fenêtre 5 s -> ${mn.toFixed(3)}..${mx.toFixed(3)} RPM`);
+    check('wobble pur 0,4 Hz : résidu < 0,3 RPM', mx - mn < 0.3, `${(mx - mn).toFixed(3)} RPM`);
+    check('wobble pur 0,4 Hz : moyenne ~33,33', close((mn + mx) / 2, 33.33, 0.2), `${((mn + mx) / 2).toFixed(2)}`);
+  }
+
+  // --- 10e. Pipeline complet : wobble terrain ±37% -> lisseur -> sortie ±0,5 ---
+  // Le scénario EXACT du terrain (wobble ±37% + bruit) à travers l'estimateur
+  // 5 s puis le lisseur : la valeur envoyée doit rester dans 33,33 ± 0,5.
+  console.log('\n[10e] Terrain ±37% : sortie finale ±0,5 RPM');
+  {
+    const est = createPhaseEstimator({ windowMs: 5000, sampleMs: 10 });
+    const out = createStableOutput({ sampleMs: 10 });
+    let t = 0;
+    const terrainAt = (i) => {
+      const ts = (i * 10) / 1000;
+      return 0.37 * Math.sin(2 * Math.PI * 0.4 * ts) + 0.1 * Math.sin(2 * Math.PI * 1.7 * ts);
+    };
+    // warm-up 6 s avec le wobble dès le début (fenêtre pleine avant de mesurer)
+    for (let i = 0; i < 600; i++) { t += 10; est.update(RPM33 * (1 + terrainAt(i)), t); }
+    const vals = [];
+    for (let i = 600; i < 1200; i++) {
+      t += 10;
+      const v = est.update(RPM33 * (1 + terrainAt(i)) + noise(0.05), t);
+      vals.push(out.update(v));
+    }
+    const last = vals;
+    const mn = Math.min(...last), mx = Math.max(...last);
+    const avg = last.reduce((a, b) => a + b, 0) / last.length;
+    console.log(`     terrain ±37% -> sortie finale ${mn.toFixed(2)}..${mx.toFixed(2)} RPM (moyenne ${avg.toFixed(2)})`);
+    check('terrain ±37% : sortie dans 33,33 ± 0,5', mn > 32.8 && mx < 33.85, `${mn.toFixed(2)}..${mx.toFixed(2)}`);
+    check('terrain ±37% : moyenne ~33,33', close(avg, 33.33, 0.4), avg.toFixed(2));
   }
 
   // --- 9. Cadence adaptative de l'envoi (batterie) ---

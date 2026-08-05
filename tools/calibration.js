@@ -174,19 +174,106 @@ export function createSmoother() {
 // C'est le vrai remède "stabilité + sensibilité au pitch" : au lieu de lisser
 // chaque échantillon (EMA, qui laisse passer le bruit ou traîne trop), on
 // INTÈGRE la vitesse axiale signée et on lit la pente sur une fenêtre
-// glissante (~3,5 s). Le bruit de mesure (rocking du téléphone, pics) est
+// glissante. Le bruit de mesure (rocking du téléphone, pics) est
 // zéro-moyenne : il s'annule dans l'intégrale, alors qu'un vrai changement
-// de pitch déplace la pente et est suivi en ~2 s. Les snaps (arrêt, relock,
+// de pitch déplace la pente et est suivi. Les snaps (arrêt, relock,
 // relâchement) ré-ensemencent la fenêtre -> réponse immédiate préservée.
-// Fenêtre de l'estimateur : LONGUE (3,5 s) en rotation stable pour annuler le
-// bruit ; RAPIDE (500 ms) juste après un snap (relock, arrêt, relâchement) pour
-// que la valeur affichée rejoigne la vraie vitesse en ~0,55 s au lieu de ~2 s.
-// Le hook appelle setWindow(FAST) sur un événement, puis revient à LONG après
-// ESTIMATOR_FAST_HOLD_MS (700 ms : assez pour converger, court pour ne pas
-// laisser le wobble ±37% parasiter le lissage trop longtemps).
-export const ESTIMATOR_WINDOW_MS = 3500;
+// Fenêtre de l'estimateur : LONGUE en rotation stable, RAPIDE (500 ms) juste
+// après un snap (relock, arrêt, relâchement) pour que la valeur affichée
+// rejoigne la vraie vitesse en ~0,55 s au lieu de ~2 s. Le hook appelle
+// setWindow(FAST) sur un événement, puis revient à LONG après
+// ESTIMATOR_FAST_HOLD_MS.
+//
+// ⚠️ POURQUOI 5 s (et pas 3,5 s) ? Le rocking réel oscille autour de ~0,4 Hz
+// (période ~2,5 s). L'intégrale d'un sinus sur un nombre ENTIER de périodes
+// s'annule parfaitement, quelle que soit la phase : avec 5 s = 2 périodes
+// exactes, le mode dominant du wobble (±37% dans les logs terrain) est
+// annulé à ~0,000 RPM au lieu de laisser ±4,5 RPM à 3,5 s (1,4 période).
+// Le pitch (changement de la pente, lent) reste suivi, et les gestes sont
+// gérés par les snaps + le lisseur de sortie (createStableOutput).
+export const ESTIMATOR_WINDOW_MS = 5000;
 export const ESTIMATOR_FAST_WINDOW_MS = 500;
 export const ESTIMATOR_FAST_HOLD_MS = 700;
+
+// --- Lisseur de SORTIE (stabilité de fou sur Rekordbox) ---
+// L'estimateur de phase élimine le wobble, mais il reste un résidu de bruit
+// sur la valeur envoyée au Pi : à 0 de pitch, Rekordbox afficherait un pitch
+// qui tremble. createStableOutput est un lisseur "freeze & catch-up" appliqué
+// à la valeur FINALE envoyée (rpmRef). Il distingue le bruit (qui oscille,
+// change de signe en permanence) d'un vrai changement (qui persiste) :
+//  - Tant que l'écart (entrée - sortie) reste sous STABLE_DEADBAND_RPM ET
+//    change de signe régulièrement, la sortie est FIGÉE : le ratio envoyé
+//    est CONSTANT en rotation stable (Rekordbox figé à 0,0% de pitch).
+//  - Si l'écart dépasse la bande (pitch réel, relâchement, geste) OU si la
+//    dérive reste du même signe pendant STABLE_PERSIST_MS (un pitch lent qui
+//    s'installe, même petit), la sortie rattrape à STABLE_CATCHUP_ALPHA
+//    (~30-100 ms) -> aucun retard perceptible.
+//  - snapTo() force la sortie instantanément (arrêt, relock, motion snap,
+//    relâchement) : le scratch et le redémarrage restent au ms.
+// En clair : la valeur envoyée est CONSTANTE en rotation stable (au lieu de
+// trembler de ±0,5 RPM), et suit la main immédiatement pendant un geste.
+export const STABLE_DEADBAND_RPM = 0.7;  // bruit max toléré : en dessous, on ne bouge pas
+// (0,7 RPM ≈ le résidu max de l'estimateur sur le wobble terrain ±37% après
+// la fenêtre 5 s ; au-dessus, c'est forcément un vrai changement de vitesse)
+export const STABLE_CATCHUP_ALPHA = 0.3; // rattrapage rapide : ~30 ms à 100 Hz
+export const STABLE_FINISH_ALPHA = 0.05; // fin de convergence après un gros écart
+// (évite de geler à 0,5 RPM sous la cible : après un pitch, on continue de
+// converger doucement pendant ~200 ms au lieu de s'arrêter net à la bande)
+export const STABLE_FINISH_SAMPLES = 20; // durée de la finition après un gros écart
+export const STABLE_DRIFT_ALPHA = 0.002; // dérive LENTE dans la bande (corrige un offset résiduel)
+// (si le wobble résiduel est centré à +0,3 RPM de la sortie figée, l'écart
+// change de signe en permanence -> la persistance ne s'arme jamais et la
+// sortie resterait gelée sur un offset permanent de ~0,3-0,6 RPM. Ce drift
+// minuscule ramène la sortie vers la moyenne de l'entrée en ~5 s, avec un
+// mouvement invisible de ~0,03 RPM/s -> la stabilité de fou est conservée.)
+export const STABLE_PERSIST_MS = 500;    // dérive unidirectionnelle requise pour un vrai changement lent
+// (un pitch qui s'installe produit un écart constant du même signe pendant
+// des secondes ; le wobble résiduel de l'estimateur, lui, change de signe
+// toutes les ~300 ms max -> jamais de fausse détection en rotation stable)
+
+export function createStableOutput({ sampleMs = 10 } = {}) {
+  let out = null;
+  let sameSign = 0;   // échantillons consécutifs dans le même sens (dérive)
+  let lastSign = 0;
+  let finishLeft = 0; // échantillons de finition restants après un gros écart
+  const persistN = Math.max(2, Math.ceil(STABLE_PERSIST_MS / sampleMs));
+  return {
+    /** @param vRpm valeur SIGNÉE (RPM) à lisser @returns la sortie lissée */
+    update(vRpm) {
+      if (out === null) {
+        out = vRpm;
+        return out;
+      }
+      const gap = vRpm - out;
+      const sign = gap > 0 ? 1 : gap < 0 ? -1 : 0;
+      sameSign = sign === lastSign && sign !== 0 ? sameSign + 1 : sign === 0 ? 0 : 1;
+      lastSign = sign;
+      const big = Math.abs(gap) > STABLE_DEADBAND_RPM;
+      const persistent = sameSign >= persistN; // vrai changement lent installé
+      if (big) finishLeft = STABLE_FINISH_SAMPLES; // un gros écart arme la finition
+      let alpha = 0;
+      if (big || persistent) alpha = STABLE_CATCHUP_ALPHA;
+      else if (finishLeft > 0) alpha = STABLE_FINISH_ALPHA; // finition : ne pas geler sous la cible
+      else alpha = STABLE_DRIFT_ALPHA; // dérive lente : referme tout offset résiduel
+      if (finishLeft > 0) finishLeft -= 1;
+      out += alpha * gap;
+      return out;
+    },
+    /** Force la sortie immédiatement (arrêt, relock, motion snap...) */
+    snapTo(vRpm) {
+      out = vRpm;
+      sameSign = 0;
+      lastSign = 0;
+      finishLeft = 0;
+    },
+    reset() {
+      out = null;
+      sameSign = 0;
+      lastSign = 0;
+      finishLeft = 0;
+    },
+  };
+}
 
 // Snap d'ARRÊT ANTICIPÉ (décélération douce) : si la vitesse BRUTE tombe à plus
 // de ce seuil SOUS l'estimé lissé (pendant ~100 ms), la platine décélère -> on
