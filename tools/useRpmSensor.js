@@ -19,6 +19,11 @@ import {
   detectRelease,
   relockStep,
   MOTION_SNAP_RPM,
+  ESTIMATOR_WINDOW_MS,
+  ESTIMATOR_FAST_WINDOW_MS,
+  ESTIMATOR_FAST_HOLD_MS,
+  SLOW_STOP_GAP_RPM,
+  SLOW_STOP_MS,
   RELOCK_CONSECUTIVE,
   STOPPED_RAD_S,
   ZERO_DEADBAND_RAD_S,
@@ -106,10 +111,12 @@ export function useRpmSensor() {
   const restBiasStartRef = useRef(null);        // instant du 1er échantillon d'immobilité (durée, pas comptage)
   const fastSpeedTrackerRef = useRef(null);     // suivi rapide pour détecter les arrêts brutaux
   const stopCandidateStartRef = useRef(null);   // instant du 1er échantillon sous le seuil d'arrêt
+  const slowStopStartRef = useRef(null);        // instant du 1er échantillon sous l'écart d'arrêt anticipé
   const lastLogTimeRef = useRef(0);             // pour limiter la fréquence des logs
   const standardSpeedRef = useRef(33.33);       // miroir de standardSpeed pour le callback gyro
   const stabilityRingRef = useRef([]);          // dernières valeurs lissées -> déviation
-  const cadenceRef = useRef('fast');            // cadence d'envoi (fast 200 ms / slow 5 s)
+  const cadenceRef = useRef('fast');            // cadence d'envoi (fast 30 ms / slow 5 s)
+  const fastWindowUntilRef = useRef(0);         // fenêtre RAPIDE de l'estimateur jusqu'à ce timestamp
 
   const rpmRef = useRef(0); // toujours à jour, lu par le sender indépendamment du re-render
 
@@ -146,6 +153,22 @@ export function useRpmSensor() {
   // Nombre d'échantillons équivalent à une durée, au taux RAPIDE du gyro
   // (les compteurs de détection sont des durées en ms, pas des échantillons).
   const nFast = (ms) => Math.max(1, Math.ceil(ms / SENSOR_FAST_INTERVAL_MS));
+
+  // Fenêtre ADAPTATIVE de l'estimateur : après un snap (relock, arrêt,
+  // relâchement, motion snap), la valeur affichée doit rejoindre la vraie
+  // vitesse en ~0,25 s, pas en ~2 s. On passe la fenêtre en RAPIDE (400 ms)
+  // pendant ESTIMATOR_FAST_HOLD_MS, puis on revient à LONGUE (3,5 s) pour la
+  // stabilité en rotation stable.
+  const useFastWindow = (now) => {
+    phaseRef.current.setWindow(ESTIMATOR_FAST_WINDOW_MS);
+    fastWindowUntilRef.current = now + ESTIMATOR_FAST_HOLD_MS;
+  };
+  const maybeRestoreWindow = (now) => {
+    if (fastWindowUntilRef.current && now >= fastWindowUntilRef.current) {
+      fastWindowUntilRef.current = 0;
+      phaseRef.current.setWindow(ESTIMATOR_WINDOW_MS);
+    }
+  };
 
   // Cadence adaptative : 200 ms en rotation, 5 s à l'arrêt (batterie/Wi-Fi).
   // Ne recrée l'intervalle QUE si la cadence change vraiment.
@@ -207,6 +230,7 @@ export function useRpmSensor() {
     restBiasStartRef.current = null;
     fastSpeedTrackerRef.current = null;
     stopCandidateStartRef.current = null;
+    slowStopStartRef.current = null;
     setRpm(0);
     rpmRef.current = 0;
     stabilityRingRef.current = [];
@@ -339,6 +363,7 @@ export function useRpmSensor() {
         if (now - stopCandidateStartRef.current >= STOP_DETECTION_MS) {
           stopCandidateStartRef.current = null;
           phaseRef.current.snapTo(0, now);
+          useFastWindow(now);   // la valeur affichée revient à ~0 immédiatement
           releaseArmedRef.current = true; // un vrai arrêt arme le relâchement
           fastSpeedTrackerRef.current = 0;
           setRpm(0);
@@ -386,6 +411,7 @@ export function useRpmSensor() {
         rpmRef.current = 0;
         if (relockCountRef.current >= RELOCK_CONSECUTIVE) {
           phaseRef.current.snapTo(absSpeed * (60 / (2 * Math.PI)), now);
+          useFastWindow(now);   // la valeur affichée remonte à 33 quasi tout de suite
           relockCountRef.current = 0;
           wasStoppedRef.current = false;
           setSendCadence(true); // la platine tourne de nouveau : envoi rapide
@@ -398,6 +424,7 @@ export function useRpmSensor() {
         wasStoppedRef.current = true;
         relockCountRef.current = 0;
         phaseRef.current.snapTo(0, now);
+        useFastWindow(now);   // retour à 0 visible immédiatement
         releaseArmedRef.current = true; // un vrai arrêt arme le relâchement
         setRpm(0);
         rpmRef.current = 0;
@@ -411,6 +438,7 @@ export function useRpmSensor() {
       // fenêtre glissante -> le bruit zéro-moyenne s'annule (stabilité) et un
       // vrai pitch déplace la pente (sensibilité). Le module sert aux
       // détections et au recalage, la direction reste instantanée.
+      maybeRestoreWindow(now); // retour à la fenêtre longue après la période rapide
       const estRpm = phaseRef.current.update(dot, now);
       const axialRpm = Math.abs(estRpm);
 
@@ -428,7 +456,31 @@ export function useRpmSensor() {
         const fastSigned =
           (fastSpeedTrackerRef.current ?? absSpeed) * (60 / (2 * Math.PI)) * (dot >= 0 ? 1 : -1);
         phaseRef.current.snapTo(fastSigned, now);
+        useFastWindow(now);   // la magnitude suit la main immédiatement
         rpmBrut = Math.abs(fastSigned);
+      }
+
+      // --- Snap d'ARRÊT ANTICIPÉ (décélération douce) ---
+      // Un arrêt "doux" (le DJ freine, ou coupe le moteur) ne franchit pas le
+      // seuil d'arrêt brutal (chute sous 10% en 100 ms) : la valeur affichée
+      // redescendait lentement via la fenêtre 3,5 s. Si la vitesse BRUTE tombe
+      // à plus de SLOW_STOP_GAP_RPM SOUS l'estimé lissé, soutenu pendant
+      // SLOW_STOP_MS, c'est une décélération réelle (et pas le wobble du
+      // rocking, dont l'écart max mesuré ~15,5 RPM reste sous les 20) : on
+      // accroche l'estimé au suivi rapide pour suivre en temps réel, puis 0
+      // dès que < STOPPED_RAD_S.
+      if (!wasStoppedRef.current && estRpm - rawRpmSigned > SLOW_STOP_GAP_RPM) {
+        if (slowStopStartRef.current === null) slowStopStartRef.current = now;
+        if (now - slowStopStartRef.current >= SLOW_STOP_MS) {
+          slowStopStartRef.current = null;
+          const fastSigned =
+            (fastSpeedTrackerRef.current ?? absSpeed) * (60 / (2 * Math.PI)) * (dot >= 0 ? 1 : -1);
+          phaseRef.current.snapTo(fastSigned, now);
+          useFastWindow(now);
+          rpmBrut = Math.abs(fastSigned);
+        }
+      } else {
+        slowStopStartRef.current = null;
       }
 
       // --- Relâchement de la platine : accrochage direct à la standard ---
@@ -453,6 +505,7 @@ export function useRpmSensor() {
         // ça, un 33 stable mais bruyant déclencherait des snaps en boucle.
         releaseArmedRef.current = false;
         phaseRef.current.snapTo(sel / gainRef.current, now);
+        useFastWindow(now);   // accroché à la standard immédiatement
         rpmBrut = sel / gainRef.current;
         setSendCadence(true);
         setGyroRate(true);

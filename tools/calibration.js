@@ -178,10 +178,29 @@ export function createSmoother() {
 // zéro-moyenne : il s'annule dans l'intégrale, alors qu'un vrai changement
 // de pitch déplace la pente et est suivi en ~2 s. Les snaps (arrêt, relock,
 // relâchement) ré-ensemencent la fenêtre -> réponse immédiate préservée.
-export function createPhaseEstimator({ windowMs = 3500, sampleMs = 50 } = {}) {
+// Fenêtre de l'estimateur : LONGUE (3,5 s) en rotation stable pour annuler le
+// bruit ; RAPIDE (500 ms) juste après un snap (relock, arrêt, relâchement) pour
+// que la valeur affichée rejoigne la vraie vitesse en ~0,55 s au lieu de ~2 s.
+// Le hook appelle setWindow(FAST) sur un événement, puis revient à LONG après
+// ESTIMATOR_FAST_HOLD_MS (700 ms : assez pour converger, court pour ne pas
+// laisser le wobble ±37% parasiter le lissage trop longtemps).
+export const ESTIMATOR_WINDOW_MS = 3500;
+export const ESTIMATOR_FAST_WINDOW_MS = 500;
+export const ESTIMATOR_FAST_HOLD_MS = 700;
+
+// Snap d'ARRÊT ANTICIPÉ (décélération douce) : si la vitesse BRUTE tombe à plus
+// de ce seuil SOUS l'estimé lissé (pendant ~100 ms), la platine décélère -> on
+// colle l'estimé au suivi rapide pour que l'affichage suive la décélération en
+// temps réel. Le wobble du rocking (écart max mesuré ~15,5 RPM avec bruit ±37%)
+// reste SOUS 20 : aucun faux déclenchement en rotation stable.
+export const SLOW_STOP_GAP_RPM = 20;
+export const SLOW_STOP_MS = 100;
+
+export function createPhaseEstimator({ windowMs = ESTIMATOR_WINDOW_MS, sampleMs = 50 } = {}) {
   const RAD2RPM = 60 / (2 * Math.PI);
   let totalAngle = 0; // intégrale signée de la vitesse axiale (rad)
   let lastT = null;   // dernier timestamp -> dt RÉEL (pas supposé)
+  let win = windowMs; // fenêtre courante (changeable via setWindow)
   const buf = [];     // fenêtre glissante : [{ t, angle }]
   return {
     /** @param dotRadS vitesse axiale SIGNÉE (rad/s) @param now ms */
@@ -195,7 +214,7 @@ export function createPhaseEstimator({ windowMs = 3500, sampleMs = 50 } = {}) {
       lastT = now;
       totalAngle += dotRadS * (elapsed / 1000);
       buf.push({ t: now, angle: totalAngle });
-      const cutoff = now - windowMs;
+      const cutoff = now - win;
       // On n'avance le bord gauche QUE si le suivant est lui-même hors
       // fenêtre : un bord VIRTUEL posé par snapTo survit donc jusqu'à ce que
       // de vraies données aient rempli la fenêtre (pas d'effondrement à 50 ms
@@ -213,11 +232,20 @@ export function createPhaseEstimator({ windowMs = 3500, sampleMs = 50 } = {}) {
       totalAngle = 0;
       lastT = now;
       buf.length = 0;
-      buf.push({ t: now - windowMs, angle: -velocity * (windowMs / 1000) });
+      buf.push({ t: now - win, angle: -velocity * (win / 1000) });
+    },
+    // Fenêtre adaptative : RAPIDE juste après un événement (relock/arrêt/…),
+    // puis retour à la fenêtre longue pour la stabilité.
+    setWindow(ms) {
+      win = Math.max(100, ms);
+    },
+    getWindow() {
+      return win;
     },
     reset() {
       totalAngle = 0;
       lastT = null;
+      win = windowMs;
       buf.length = 0;
     },
   };
@@ -372,8 +400,13 @@ export const MOTION_SNAP_RPM = 25;
 // bougeant à peine. Désormais il faut une vitesse SOUTENUE élevée
 // (3 rad/s ≈ 28,6 RPM, un vrai scratch/sec) pendant plusieurs échantillons
 // consécutifs.
-export const RELOCK_MIN_RAD_S = 3.0; // ~28,6 RPM : en dessous, on ne ré-accroche pas
-export const RELOCK_CONSECUTIVE = 3; // 3 échantillons consécutifs au-dessus du seuil
+export const RELOCK_MIN_RAD_S = 2.0; // ~19,1 RPM : en dessous, on ne ré-accroche pas
+// (2.0 rad/s au lieu de 3.0 : un backspin/scratch MOYEN (~20 RPM) ré-accroche
+// lui aussi, pas seulement les gestes violents. Un petit geste du poignet
+// (< 19 RPM) reste sous le seuil et ne déclenche rien.)
+export const RELOCK_CONSECUTIVE = 5; // 5 échantillons consécutifs au-dessus du seuil
+// (50 ms à 100 Hz : filtre les micro-gestes transitoires qui dépasseraient
+// brièvement 19 RPM, tout en gardant un vrai backspin/scratch bien réactif.)
 // Sous cette vitesse (~9,5 RPM) on considère la platine comme (quasi) à
 // l'arrêt : on recolle à 0 et on attend un vrai geste pour repartir.
 export const STOPPED_RAD_S = 1.0;

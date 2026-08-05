@@ -24,6 +24,10 @@ const {
   detectRelease,
   relockStep,
   MOTION_SNAP_RPM,
+  ESTIMATOR_WINDOW_MS,
+  ESTIMATOR_FAST_WINDOW_MS,
+  ESTIMATOR_FAST_HOLD_MS,
+  SLOW_STOP_GAP_RPM,
   RELOCK_MIN_RAD_S,
   RELOCK_CONSECUTIVE,
   closestStandard,
@@ -468,9 +472,44 @@ try {
   console.log('\n[7] Constantes de calibration');
   check('BIAS_CALIBRATION_MS = 3000 (3 s)', CALIBRATION_TIMINGS.BIAS_CALIBRATION_MS === 3000);
   check('AXIS_CALIBRATION_MS = 1500 (1,5 s)', CALIBRATION_TIMINGS.AXIS_CALIBRATION_MS === 1500);
-  check('RELOCK_MIN_RAD_S = 3.0 (~28,6 RPM)', RELOCK_MIN_RAD_S === 3.0);
-  check('RELOCK_CONSECUTIVE = 3 échantillons', RELOCK_CONSECUTIVE === 3);
+  check('RELOCK_MIN_RAD_S = 2.0 (~19,1 RPM, backspin moyen ré-accroche)', RELOCK_MIN_RAD_S === 2.0, `actuel: ${RELOCK_MIN_RAD_S}`);
+  check('RELOCK_CONSECUTIVE = 5 échantillons (~50 ms, filtre micro-geste)', RELOCK_CONSECUTIVE === 5, `actuel: ${RELOCK_CONSECUTIVE}`);
   check('MOTION_SNAP_RPM = 25 (> wobble max ~18, < geste réel)', MOTION_SNAP_RPM === 25, `actuel: ${MOTION_SNAP_RPM}`);
+  check('SLOW_STOP_GAP_RPM = 20 (> wobble max ~15,5, < décélération réelle)', SLOW_STOP_GAP_RPM === 20, `actuel: ${SLOW_STOP_GAP_RPM}`);
+
+  // Le snap d'arrêt anticipé se base sur l'écart (estimé - brut) : sur le wobble
+  // réel ±37% (le pire cas des logs : ratio 0.79-1.54), l'écart doit rester SOUS
+  // SLOW_STOP_GAP_RPM en permanence -> jamais de faux snap en rotation stable.
+  {
+    const est = createPhaseEstimator();
+    let t = 0;
+    let maxGap = 0;
+    for (let i = 0; i < 200; i++) {
+      t += 50;
+      const ts = i / 33.33;
+      const slip = 0.37 * Math.sin(2 * Math.PI * 0.4 * ts);
+      const wz = RPM33 * (1 + slip) + noise(0.05);
+      const v = est.update(wz, t);
+      const rawSigned = (wz >= 0 ? 1 : -1) * Math.abs(wz) * RAD2RPM;
+      maxGap = Math.max(maxGap, v - rawSigned);
+    }
+    console.log(`     wobble ±37% stable : écart max (estimé - brut) = ${maxGap.toFixed(1)} RPM`);
+    check('arrêt anticipé : wobble ±37% reste sous 20 (pas de faux snap)', maxGap < SLOW_STOP_GAP_RPM, `${maxGap.toFixed(1)} vs ${SLOW_STOP_GAP_RPM}`);
+    // une décélération réelle (33 -> 5 en ~0,5 s) dépasse largement les 20
+    const est2 = createPhaseEstimator();
+    t = 0;
+    let maxGap2 = 0;
+    for (let i = 0; i < 20; i++) { t += 50; est2.update(RPM33, t); }
+    for (let i = 0; i < 15; i++) {
+      t += 50;
+      const frac = 1 - i / 15;
+      const wz = RPM33 * frac; // décélération franche
+      const v = est2.update(wz, t);
+      maxGap2 = Math.max(maxGap2, v - (wz >= 0 ? 1 : -1) * Math.abs(wz) * RAD2RPM);
+    }
+    console.log(`     décélération franche : écart max = ${maxGap2.toFixed(1)} RPM`);
+    check('arrêt anticipé : décélération réelle dépasse 20 (snap OK)', maxGap2 > SLOW_STOP_GAP_RPM, `${maxGap2.toFixed(1)} vs ${SLOW_STOP_GAP_RPM}`);
+  }
 
   // --- 7b. Motion snap : seuil cohérent avec le terrain ---
   // Le wobble du rocking observé (ratio 0.79-1.54 = ±37% ≈ ±12 RPM de
@@ -505,10 +544,11 @@ try {
   // (>= ~28,6 RPM soutenu) doit accrocher directement.
   console.log('\n[8] Ré-accrochage strict après arrêt');
   {
-    // unit : relockStep
-    check('relockStep : 2 rad/s (petit geste) -> 0', relockStep(2, 2.0) === 0);
+    // unit : relockStep (seuil 2.0 rad/s ≈ 19 RPM)
+    check('relockStep : 1.5 rad/s (petit geste ~14 RPM) -> 0', relockStep(2, 1.5) === 0);
+    check('relockStep : 2.1 rad/s (backspin moyen ~20 RPM) -> incrémente', relockStep(0, 2.1) === 1);
     check('relockStep : 3.5 rad/s (vrai geste) -> incrémente', relockStep(0, 3.5) === 1);
-    check('relockStep : sous le seuil remet à 0', relockStep(2, 1.5) === 0);
+    check('relockStep : sous le seuil remet à 0', relockStep(2, 1.0) === 0);
 
     // scénario : arrêt puis petit geste (±17 RPM ≈ 1.78 rad/s) pendant 30
     // échantillons -> ne doit PAS ré-accrocher (le lissé reste ~0)
@@ -605,6 +645,48 @@ try {
       }
       check('phase : backspin soutenu -> ~-33', v < -30, v.toFixed(1));
     }
+  }
+
+  // --- 10b. LE PROBLÈME DU TERRAIN : arrêt puis redémarrage ---
+  // "l'app met un temps fou à mettre 0 quand j'arrête et à remettre 33 quand
+  // elle repart". Avec la fenêtre adaptative (FAST 400 ms après un snap,
+  // retour LONG après 1,5 s), la valeur affichée doit rejoindre 0 et 33 en
+  // ~0,3 s au lieu de ~2 s.
+  console.log('\n[10b] Arrêt + redémarrage rapides (fenêtre adaptative)');
+  {
+    const RPM33rad = RPM33; // 33.33 RPM en rad/s
+    // Reproduit le hook : snapTo(0) à l'arrêt (avec useFastWindow), puis
+    // relock snapTo(~30) au redémarrage (avec useFastWindow), puis la platine
+    // rejoint 33.33 et on restaure la fenêtre longue après ESTIMATOR_FAST_HOLD_MS.
+    const est = createPhaseEstimator();
+    let t = 0;
+    // 1 s de rotation stable à 33
+    for (let i = 0; i < 20; i++) { t += 50; est.update(RPM33rad, t); }
+    // ARRÊT : le hook snap à 0 + fenêtre rapide
+    est.snapTo(0, t); est.setWindow(ESTIMATOR_FAST_WINDOW_MS);
+    let fastHoldUntil = t + ESTIMATOR_FAST_HOLD_MS;
+    let atZero = -1;
+    for (let i = 0; i < 20; i++) {
+      t += 50;
+      const v = Math.abs(est.update(0.02, t));
+      if (atZero < 0 && v < 1) atZero = t;
+    }
+    check('arrêt : affiche ~0 en <0,4 s', atZero >= 0 && (atZero - 1000) / 1000 < 0.4, `${(atZero / 1000).toFixed(2)} s`);
+
+    // REDÉMARRAGE : le relock snap à ~30 (vitesse au moment de l'accroche),
+    // puis la platine rejoint 33.33. Fenêtre rapide pendant 1,5 s.
+    est.snapTo(30, t); est.setWindow(ESTIMATOR_FAST_WINDOW_MS);
+    fastHoldUntil = t + ESTIMATOR_FAST_HOLD_MS;
+    let over33 = -1;
+    for (let i = 0; i < 40; i++) {
+      t += 50;
+      if (t >= fastHoldUntil && est.getWindow() === ESTIMATOR_FAST_WINDOW_MS) est.setWindow(ESTIMATOR_WINDOW_MS);
+      const v = Math.abs(est.update(RPM33rad, t));
+      if (over33 < 0 && v > 32.5) over33 = t;
+    }
+    check('redémarrage : affiche >32.5 en <0,8 s après relock', over33 >= 0 && (over33 - 2000) / 1000 < 0.8, `${(over33 / 1000).toFixed(2)} s`);
+    // la fenêtre doit bien revenir à LONGUE après la période rapide
+    check('fenêtre restaurée à 3500 ms', est.getWindow() === 3500, `actuel: ${est.getWindow()}`);
   }
 
   // --- 9. Cadence adaptative de l'envoi (batterie) ---
