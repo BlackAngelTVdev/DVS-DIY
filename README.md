@@ -1,8 +1,19 @@
-# 🎚️ DVS DIY — PhaseApp
+# 🚀 DVS DIY — PhaseApp
 
-Un système **DVS (Digital Vinyl System)** maison : ton téléphone posé sur la platine vinyle
-mesure la vitesse de rotation avec son **gyroscope**, et un Raspberry Pi joue le **timecode
-audio** à la vitesse correspondante — exactement le principe de Rekordbox/Serato, mais en DIY.
+![Stars](https://img.shields.io/github/stars/BlackAngelTVdev/DVS-DIY?style=for-the-badge&color=yellow)
+![Commits](https://img.shields.io/github/commit-activity/m/BlackAngelTVdev/DVS-DIY?style=for-the-badge&color=blue)
+![Issues](https://img.shields.io/github/issues/BlackAngelTVdev/DVS-DIY?style=for-the-badge&color=orange)
+![Forks](https://img.shields.io/github/forks/BlackAngelTVdev/DVS-DIY?style=for-the-badge&color=808080)
+![Last Commit](https://img.shields.io/github/last-commit/BlackAngelTVdev/DVS-DIY?style=for-the-badge&color=blue)
+
+> **Un système DVS (Digital Vinyl System) 100% maison : ton téléphone posé sur la platine mesure la rotation avec son gyroscope, et un Raspberry Pi joue le timecode à la vitesse correspondante — le principe de Rekordbox/Serato, mais en DIY.**
+> *Exemple : une platine vinyle contrôlée par ton téléphone + un Raspberry Pi, sans carte son dédiée.*
+
+---
+
+## 🧐 Aperçu
+
+Le fonctionnement en un schéma :
 
 ```mermaid
 flowchart LR
@@ -11,179 +22,87 @@ flowchart LR
     C["🎛️ Rekordbox / Serato"]
     N{{"⏸️ son coupé si +0,5 s de silence"}}
 
-    A -->|"ratio signé : +1.0000<br/>HTTP POST toutes les 200 ms"| B
-    B -->|"timecode.wav à la vitesse reçue<br/>DAC → Rekordbox / Serato"| C
-    B -.->|"timeout 0,5 s"| N
+    A -->|"1. Le gyro mesure la vitesse angulaire de la platine<br/>2. L'app calibre le biais + l'axe de rotation<br/>3. Le ratio = RPM mesuré / 33,33 (signé : négatif = backspin)<br/>4. Envoi HTTP POST toutes les 30 ms"| B
+    B -->|"1. Lit timecode.wav en mémoire<br/>2. Joue le timecode à la vitesse reçue (ratio signé)<br/>3. Sortie audio → DAC USB → Rekordbox/Serato<br/>4. Lissage du ratio (module) mais signe instantané"| C
+    B -.->|"aucune requête depuis 0,5 s → son coupé<br/>(timeout de sécurité)"| N
 ```
 
-**Version texte** (terminaux) :
+- **Backspin & scratch fonctionnels** : le ratio est **signé** (négatif = lecture à reculons), détection quasi instantanée grâce au gyro à 100 Hz en mesure.
+- **Calibration guidée** : biais → axe → mesure, avec recalage automatique continu du gain.
+- **Réactif ET stable** : estimateur de phase (fenêtre glissante) qui annule le bruit du rocking, + motion snap qui colle la magnitude à la main pendant les scratchs (~50 ms).
 
-```
-┌────────────────────┐    ratio signé (HTTP POST, 5 Hz)     ┌────────────────────┐
-│     Téléphone      │  ─────────────────────────────────>  │    Raspberry Pi    │
-│     (app Expo)     │        texte brut : "+1.0000"        │  (serveur Python)  │
-│                    │                                      │                    │
-│     gyro → RPM     │  <─────────────────────────────────  │    timecode.wav    │
-│  → ratio / 33.33   │      pause si +0,5 s de silence      │  DAC → Rekordbox   │
-└────────────────────┘                                      └────────────────────┘
-```
+## ✨ Fonctionnalités
 
-- **Backspin & scratch fonctionnels** : le ratio est **signé** (négatif = lecture à reculons).
-- **Calibration guidée** : biais → axe → mesure, avec recalage automatique continu.
-- **Sans aucune librairie externe** côté UI (Animated natif de React Native).
+- ✅ **Platine numérique DIY** : le téléphone devient la cellule DVS, le Pi le plateau.
+- ✅ **Latence quasi nulle** : gyro 100 Hz, envoi HTTP 33 Hz, latence audio réduite (blocksize 512).
+- ✅ **Sensible au pitch** : le recalage auto ne corrige que la dérive (±2 %), un pitch volontaire du DJ est respecté.
+- ✅ **Anti-micro-geste** : à l'arrêt, un petit mouvement du poignet ne déclenche rien ; il faut un vrai geste soutenu.
+- ✅ **Économie batterie** : en rotation = gyro 100 Hz + envoi 30 ms ; à l'arrêt = gyro 20 Hz + 1 envoi / 5 s.
+- ✅ **Sélecteur 33/45/78** dans l'interface, indicateur de stabilité en direct.
 
----
+## 🛠 Tech Stack
 
-## 🗂️ Structure du projet
+| Technologie | Usage |
+| :--- | :--- |
+| ![React Native](https://img.shields.io/badge/React%20Native-61DAFB?style=flat-square&logo=react&logoColor=black) | App mobile (Expo) : capteurs, UI, envoi HTTP |
+| ![Expo](https://img.shields.io/badge/Expo-000020?style=flat-square&logo=expo&logoColor=white) | Build & dev client (Expo Go / dev build) |
+| ![Python](https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=python&logoColor=white) | Serveur DVS sur Raspberry Pi (sounddevice) |
+| ![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-C51A4A?style=flat-square&logo=raspberrypi&logoColor=white) | Lecture du timecode → DAC USB → Rekordbox |
 
-```
-.
-├── App.js                     # Point d'entrée : connecte le hook au composant d'affichage
-├── app.json                   # Config Expo (slug, package Android, EAS)
-├── eas.json                   # Profils de build EAS (development / preview / production)
-├── package.json               # Dépendances + scripts (start sur le port 8082)
-│
-├── tools/
-│   ├── useRpmSensor.js        # Hook React : capteurs, calibration, calcul du RPM, envoi
-│   ├── calibration.js         # Fonctions PURES : biais, axe, lissage, gain, relock… (testable)
-│   ├── speedSender.js         # Envoi du ratio au Pi (HTTP POST, 5 Hz) — ⚠️ IP à configurer
-│   ├── RpmDisplay.js          # Interface néon (compte-tours, stepper, état serveur)
-│   └── test-calibration.mjs   # 48 tests unitaires de la logique de calibration
-│
-└── pi-server/
-    ├── main.py                # Serveur DVS Python (à déployer sur le Pi)
-    ├── dvs.service            # Service systemd (démarrage auto, optionnel)
-    └── timecode.wav           # Ton fichier timecode (à copier sur le Pi)
-```
+## 🚀 Installation & Lancement
 
----
+1. **Cloner le projet**
+   ```bash
+   git clone https://github.com/BlackAngelTVdev/DVS-DIY.git
+   cd DVS-DIY
+   ```
+2. **Installer les dépendances** (app)
+   ```bash
+   npm install
+   ```
+3. **Configurer l'IP du Raspberry Pi**
+   Dans `tools/speedSender.js`, mets l'IP LAN de ton Pi :
+   ```js
+   export const SERVER_IP = '192.168.x.x'; // ← IP affichée au démarrage du serveur
+   ```
+4. **Lancer l'app**
+   ```bash
+   npm start          # démarre Metro sur le port 8082 (le 8081 est souvent pris)
+   ```
+   Scanne le QR code avec Expo Go ou un dev build.
+5. **Côté Raspberry Pi** (dossier `~/phase`)
+   ```bash
+   python3 main.py    # ou l'alias : py main.py
+   ```
 
-## 📱 L'app (Expo)
-
-### Prérequis
-
-- Node.js + npm
-- [Expo Go](https://expo.dev/go) ou un **dev build** (`expo-dev-client`) sur ton téléphone
-- Le téléphone et le Pi **sur le même réseau Wi-Fi**
-
-### Installation & lancement
-
-```bash
-npm install
-npm start          # démarre le serveur Metro sur le port 8082
-```
-
-Puis scanne le QR code avec Expo Go / le dev build.
-
-> ℹ️ Le port est **8082** (et non 8081) : le 8081 est souvent pris sur ce poste par le
-> conteneur Docker **phpMyAdmin**. Si tu as besoin du 8081, libère-le avec `docker stop pma`.
-
-### Utilisation
+## 📖 Utilisation
 
 1. **« Calibrer biais »** — pose le téléphone **immobile** sur la platine (3 s).
-2. **« Démarrer »** — lance la platine et laisse tourner **~1,5 s** (détection de l'axe),
-   puis tu es en **mesure** : le RPM s'affiche et le ratio part vers le Pi.
+2. **« Démarrer »** — lance la platine, attends ~1,5 s (détection de l'axe), tu es en **mesure** : le RPM s'affiche et le ratio part vers le Pi.
 3. **« Arrêter »** — envoie `0` au serveur et coupe le flux.
+4. Scratche, backspine, règle le pitch : le timecode suit ton plateau.
 
-### ⚙️ Configuration
+## 🤝 Contribution
 
-| Paramètre | Où | Valeur par défaut |
-|---|---|---|
-| **IP du Pi** | `tools/speedSender.js` → `SERVER_IP` | `192.168.1.140` |
-| Port du Pi | `tools/speedSender.js` → `SERVER_PORT` | `5005` |
-| RPM de référence | `tools/speedSender.js` → `REFERENCE_RPM` | `33.33` |
-| Vitesses standard | `tools/calibration.js` → `STANDARD_SPEEDS` | `[33.33, 45, 78]` |
+1. Forkez le projet
+2. Créez votre branche (`git checkout -b feature/AmazingFeature`)
+3. Commitez (`git commit -m 'Add some AmazingFeature'`)
+4. Poussez (`git push origin feature/AmazingFeature`)
+5. Ouvrez une Pull Request
 
-L'IP du Pi s'affiche au démarrage du serveur (`IP du serveur : 192.168.x.x`) — reporte-la dans
-`speedSender.js` si elle change.
+## 👤 Auteur
 
-### 🔋 Optimisations batterie
-
-- Gyro à **20 Hz** (50 ms), accéléromètre à **10 Hz** (ne sert qu'au rejet de choc)
-- Envoi HTTP à **5 Hz** (200 ms) — 2,5× sous le timeout serveur de 0,5 s
-- Re-rendus UI limités à ~12 fps (la valeur envoyée, elle, reste à jour à chaque échantillon)
+**BlackAngelTVdev**
+![Follow](https://img.shields.io/github/followers/BlackAngelTVdev?label=Follow%20Me&style=social)
 
 ---
+## 📄 Licence
 
-## 🍓 Le serveur Pi
+Ce projet est sous licence :
+![GitHub License](https://img.shields.io/github/license/BlackAngelTVdev/DVS-DIY?style=flat-square&color=blue)
 
-### Prérequis (sur le Raspberry Pi)
+### 🧑‍💻 Contributors
 
-```bash
-sudo apt install python3-pip portaudio19-dev
-pip3 install numpy sounddevice soundfile zeroconf getkey
-```
+Merci à toutes les personnes qui contribuent au projet.
 
-Puis copie dans `~/phase/` :
-- `pi-server/main.py`
-- ton fichier `timecode.wav` (celui qu'utilise déjà ta configuration DVS)
-
-### Lancement
-
-```bash
-cd ~/phase
-python3 main.py           # production (silencieux au démarrage)
-python3 main.py --dev     # dev : contrôles clavier (▲ ▼ Espace = vitesse / pause)
-python3 main.py --test    # auto-test : vérifie que le port 5005 répond, sans son
-```
-
-Le serveur :
-- charge `timecode.wav` en mémoire et le joue via ton **DAC USB** (détecté automatiquement) ;
-- écoute sur le **port 5005** (HTTP) et **coupe le son** si l'app n'envoie rien pendant **0,5 s** ;
-- **lisse le ratio** (anti à-coucs) mais garde le **signe instantané** (backspin réactif) ;
-- s'annonce en **mDNS** (`_dvs._udp.local.`) pour être trouvé sur le réseau.
-
-### Démarrage automatique (watchdog, sans sudo)
-
-Le serveur est protégé par un **watchdog cron** : toutes les minutes, si le port 5005 ne
-répond pas, il relance le serveur. Il démarre donc **tout seul au boot** et survit aux crashs :
-
-```bash
-# ajouté sur le Pi via crontab -e
-* * * * * (ss -ltn | grep -q :5005) || (cd ~/phase && setsid nohup python3 -u main.py >> dvs.log 2>&1 &)
-```
-
-Un service **systemd** (`dvs.service`) est fourni dans `pi-server/` pour les installations
-sans conteneur : `sudo cp dvs.service /etc/systemd/system/ && sudo systemctl enable --now dvs`.
-
----
-
-## 🧪 Tests
-
-```bash
-npm test
-```
-
-48 tests unitaires couvrant la logique de calibration pure (elle est isolée dans
-`calibration.js` pour être testable en Node) :
-
-- biais par médiane (robuste aux outliers), axe de rotation, lissage adaptatif au bruit
-- **recalage automatique du gain** vers 33.3/45/78 (bande ±6 %, sans écraser un décalage voulu)
-- **relâchement** de la platine → accrochage direct à la vitesse standard
-- **ré-accrochage strict** : un petit geste (±17 RPM) ne déclenche rien, un vrai scratch oui
-- arrêt brutal → remise à 0 immédiate, backspin → direction instantanée
-
----
-
-## 🔍 Dépannage
-
-| Problème | Cause / Solution |
-|---|---|
-| « Port 8081 is being used » au lancement d'Expo | Le conteneur Docker `pma` (phpMyAdmin) occupe 8081. `npm start` utilise déjà le port **8082**, ou libère-le : `docker stop pma` |
-| L'app affiche `0.0` et rien ne bouge | Mauvaise IP du Pi dans `speedSender.js` ; vérifie le Wi-Fi (même réseau) ; `python3 main.py --test` sur le Pi pour vérifier le port 5005 |
-| Le serveur coupe le son toutes les ~0,5 s | L'app n'envoie plus : vérifie le flux dans les logs du Pi (`FLUX ACTIF` / `AUCUNE DONNÉE`) |
-| RPM affiché ~31-32 au lieu de 33.3 | Normal : le **recalage automatique du gain** corrige ça en ~15-20 s de rotation stable, puis le gain est mémorisé |
-| À-coups dans le son | Le téléphone doit être **fermement fixé** sur la platine (velcro / Dual Lock). La mesure axiale + le lissage double (app + serveur) font le reste |
-| Le backspin / scratch ne marche pas | Vérifie que l'axe a été calibré avec une rotation **avant** ; le ratio envoyé doit être négatif en backspin (logs `ratio reçu : -0.85`) |
-
----
-
-## 🛠️ Build de production (EAS)
-
-```bash
-npx eas build --profile production --platform android
-npx eas submit --platform android
-```
-
-Profils définis dans `eas.json` (`development` / `preview` / `production` avec auto-increment
-de version). Le projet est lié au compte EAS `djdamss-team`.
+[![Contributors](https://contrib.rocks/image?repo=BlackAngelTVdev/DVS-DIY)](https://github.com/BlackAngelTVdev/DVS-DIY/graphs/contributors)
