@@ -31,6 +31,9 @@ const {
   MOTION_SNAP_RESNAP_RPM,
   MOTION_SNAP_RESNAP_CONSECUTIVE,
   STOPPED_MS,
+  STOPPED_RAD_S,
+  BACKSPIN_GUARD_MS,
+  BACKSPIN_CLEAR_MS,
   SLOW_STOP_MS,
   ESTIMATOR_WINDOW_MS,
   ESTIMATOR_FAST_WINDOW_MS,
@@ -507,7 +510,9 @@ try {
   check('MOTION_SNAP_FLIP_MIN_RPM = 19 (un vrai flip repart à ±20-33 RPM)', MOTION_SNAP_FLIP_MIN_RPM === 19, `actuel: ${MOTION_SNAP_FLIP_MIN_RPM}`);
   check('MOTION_SNAP_RESNAP_RPM = 16 (> wobble max ~15,5, < retour de geste)', MOTION_SNAP_RESNAP_RPM === 16, `actuel: ${MOTION_SNAP_RESNAP_RPM}`);
   check('MOTION_SNAP_RESNAP_CONSECUTIVE = 2 (re-snap rapide en mode geste)', MOTION_SNAP_RESNAP_CONSECUTIVE === 2, `actuel: ${MOTION_SNAP_RESNAP_CONSECUTIVE}`);
-  check('STOPPED_MS = 120 (flip de scratch < 120 ms, arrêt réel > 120 ms)', STOPPED_MS === 120, `actuel: ${STOPPED_MS}`);
+  check('STOPPED_MS = 350 (backspin lent < 350 ms ne coupe pas, arrêt réel > 350 ms)', STOPPED_MS === 350, `actuel: ${STOPPED_MS}`);
+  check('BACKSPIN_GUARD_MS = 1000 (flip de sens -> arrêts neutralisés)', BACKSPIN_GUARD_MS === 1000, `actuel: ${BACKSPIN_GUARD_MS}`);
+  check('BACKSPIN_CLEAR_MS = 300 (immobilité -> la garde se lève)', BACKSPIN_CLEAR_MS === 300, `actuel: ${BACKSPIN_CLEAR_MS}`);
   check('SLOW_STOP_MS = 200 (creux transitoire < 200 ms, freinage réel > 200 ms)', SLOW_STOP_MS === 200, `actuel: ${SLOW_STOP_MS}`);
   check('SLOW_STOP_GAP_RPM = 20 (> wobble max ~15,5, < décélération réelle)', SLOW_STOP_GAP_RPM === 20, `actuel: ${SLOW_STOP_GAP_RPM}`);
 
@@ -784,12 +789,147 @@ try {
       // l'arrêt doux DOIT toujours fonctionner sur un VRAI arrêt : le DJ tient
       // le disque à ~5,7 RPM (0,6 rad/s — SOUS le seuil d'arrêt 1.0 rad/s,
       // MAIS au-dessus du déclencheur d'arrêt brutal qui exige <10% du suivi
-      // rapide) pendant >120 ms -> la sortie doit retomber à 0 via le chemin
-      // d'arrêt doux (ce scénario teste EXACTEMENT la logique à durée soutenue,
-      // pas l'arrêt brutal).
-      for (let i = 0; i < 6; i++) samples.push({ x: 0, y: 0, z: 0.6 });
+      // rapide) pendant 10 échantillons (500 ms > STOPPED_MS 350 ms) -> la
+      // sortie doit retomber à 0 via le chemin d'arrêt doux (ce scénario teste
+      // EXACTEMENT la logique à durée soutenue, pas l'arrêt brutal).
+      for (let i = 0; i < 10; i++) samples.push({ x: 0, y: 0, z: 0.6 });
       const r2 = simulate(samples, bias);
       check('scratch : un VRAI arrêt (tenu à ~5 RPM) retombe à 0', r2 && close(r2.trace[r2.trace.length - 1], 0, 1.5), r2?.trace[r2.trace.length - 1].toFixed(2));
+    }
+  }
+
+  // --- 8c. BACKSPIN : le passage par zéro ne coupe JAMAIS le son ---
+  // LA PRIORITÉ DU DJ : "je veux pouvoir backspiner sans que ça coupe parce
+  // qu'on passe à 0". Pendant un backspin, la vitesse descend de +33 vers 0
+  // puis repart en négatif : elle traverse la zone < 9,5 RPM (1.0 rad/s).
+  // L'ANCIEN arrêt doux (120 ms) se déclenchait sur un backspin LENT
+  // (~250-300 ms de traversée) -> wasStopped + snap à 0 + relock = COUPURE.
+  // Avec STOPPED_MS = 350 ms, la traversée d'un backspin réel ne déclenche
+  // rien, seule une vraie immobilité prolongée déclenche. Ce test reproduit la
+  // machine d'arrêt doux EXACTE du hook (timestamps ms réels, reprise du
+  // chrono dès que la vitesse repart au-dessus de 1.0 rad/s).
+  console.log('\n[8c] Backspin : traversée de zéro sans coupure');
+  {
+    // Machine fidèle au hook : le chrono d'arrêt doux part quand la vitesse
+    // passe sous 1.0 rad/s, se RESET dès qu'elle repart au-dessus (le `else`),
+    // ET est neutralisé par la garde backspin. La garde s'arme au flip du
+    // signe (vitesse notable > ZERO_DEADBAND), se RÉ-ARME tant que la platine
+    // bouge dans le sens du backspin, et se LÈVE quand la platine redevient
+    // immobile pendant BACKSPIN_CLEAR_MS. Un backspin traverse zéro (signe
+    // change), un vrai arrêt non (la platine décélère vers 0 sans changer de
+    // sens).
+    const softStopMachine = () => {
+      let start = null;
+      let stopped = 0;
+      let lastSign = 0;
+      let guardUntil = 0;
+      let restStart = null;
+      let wasStopped = false; // après un arrêt déclaré, le hook reste wasStopped (pas de re-déclaration)
+      return {
+        // absSpeedRadS : |dot| ; signedDot : dot (pour le signe)
+        step(absSpeedRadS, signedDot, now) {
+          if (wasStopped) return; // déjà arrêté (comme le hook : wasStopped -> relock)
+          if (absSpeedRadS > ZERO_DEADBAND_RAD_S) {
+            const sign = signedDot >= 0 ? 1 : -1;
+            if (lastSign !== 0 && lastSign !== sign) {
+              guardUntil = now + BACKSPIN_GUARD_MS; // flip : backspin
+            } else if (guardUntil > now) {
+              guardUntil = now + BACKSPIN_GUARD_MS; // prolonge le backspin en cours
+            }
+            lastSign = sign;
+            restStart = null;
+          } else if (absSpeedRadS < ZERO_DEADBAND_RAD_S && guardUntil > now) {
+            if (restStart === null) restStart = now;
+            else if (now - restStart >= BACKSPIN_CLEAR_MS) {
+              guardUntil = 0; // immobilité : la garde se lève (vrai arrêt)
+              restStart = null;
+            }
+          }
+          if (absSpeedRadS >= STOPPED_RAD_S) { start = null; return; } // reprise du chrono
+          if (now < guardUntil) { start = null; return; } // backspin : arrêt neutralisé
+          if (start === null) start = now;
+          if (now - start >= STOPPED_MS) { start = null; stopped += 1; wasStopped = true; }
+        },
+        get stopped() {
+          return stopped;
+        },
+      };
+    };
+
+    // a) BACKSPIN LENT (250 ms sous le seuil) SANS flip de signe détecté :
+    //    SOUS les 350 ms de STOPPED_MS -> aucun arrêt
+    {
+      const m = softStopMachine();
+      let t = 0;
+      for (let i = 0; i < 25; i++) { t += 10; m.step(0.8, 0.8, t); } // 250 ms sous le seuil
+      for (let i = 0; i < 100; i++) { t += 10; m.step(3.49, -3.49, t); } // backspin à -33
+      check('backspin lent (250 ms sous le seuil) : AUCUN arrêt', m.stopped === 0, `${m.stopped} arrêt(s)`);
+    }
+    // b) BACKSPIN LENT AVEC FLIP DE SIGNE (le cas réel) : la vitesse traverse
+    //    zéro, le signe s'inverse (passage + -> -) -> la garde backspin
+    //    neutralise l'arrêt même si la traversée dépasse 350 ms
+    {
+      const m = softStopMachine();
+      let t = 0;
+      // rotation avant : signe +, puis traversée de zéro : signe -> -
+      for (let i = 0; i < 20; i++) { t += 10; m.step(3.49, 3.49, t); }
+      for (let i = 0; i < 10; i++) { t += 10; m.step(0.8, -0.8, t); } // 100 ms bas, signe - (flip)
+      for (let i = 0; i < 50; i++) { t += 10; m.step(0.5, -0.5, t); } // 500 ms encore bas (garde ré-armée)
+      for (let i = 0; i < 100; i++) { t += 10; m.step(3.49, -3.49, t); } // backspin soutenu
+      check('backspin lent + flip (600 ms bas) : AUCUN arrêt', m.stopped === 0, `${m.stopped} arrêt(s)`);
+    }
+    // b2) BACKSPIN TRÈS LONG (> 1 s dans le sens négatif) : la garde se
+    //     ré-arme tant que la platine bouge -> toujours AUCUN arrêt
+    {
+      const m = softStopMachine();
+      let t = 0;
+      for (let i = 0; i < 20; i++) { t += 10; m.step(3.49, 3.49, t); }
+      for (let i = 0; i < 10; i++) { t += 10; m.step(0.8, -0.8, t); } // flip
+      // 2,5 s à vitesse variable en négatif (la main continue de bouger)
+      for (let i = 0; i < 250; i++) { t += 10; m.step(1.5 + 0.3 * Math.sin(i / 5), -1.5, t); }
+      check('backspin long (2,5 s) : AUCUN arrêt', m.stopped === 0, `${m.stopped} arrêt(s)`);
+    }
+    // c) VRAIE IMMOBILITÉ : la vitesse reste sous le seuil pendant 500 ms SANS
+    //    changement de signe (la platine décélère vers 0 et s'y arrête, le
+    //    sens reste le même) -> EXACTEMENT 1 arrêt déclaré (à ~350 ms)
+    {
+      const m = softStopMachine();
+      let t = 0;
+      let firstStopAt = -1;
+      // décélération : signe + constant. La vitesse passe SOUS 1.0 rad/s au
+      // 21e échantillon (t=210 ms) : le chrono démarre là, + 350 ms -> arrêt
+      // attendu vers t=560 ms.
+      const firstBelow = 21 * 10; // 210 ms : 1er échantillon sous STOPPED_RAD_S
+      for (let i = 0; i < 20; i++) { t += 10; m.step(3.49, 3.49, t); }
+      for (let i = 0; i < 60; i++) {
+        t += 10;
+        const before = m.stopped;
+        m.step(0.5, 0.5, t);
+        if (m.stopped > before && firstStopAt < 0) firstStopAt = t;
+      }
+      check('vraie immobilité (500 ms, même sens) : EXACTEMENT 1 arrêt', m.stopped === 1, `${m.stopped} arrêt(s)`);
+      check('vraie immobilité : arrêt déclaré ~350 ms après le passage sous le seuil', close(firstStopAt, firstBelow + STOPPED_MS, 60), `t=${firstStopAt} ms (attendu ~${firstBelow + STOPPED_MS})`);
+    }
+    // d) BACKSPIN PUIS VRAI ARRÊT : la garde se lève quand la platine redevient
+    //    immobile (BACKSPIN_CLEAR_MS) -> l'arrêt réel est détecté normalement,
+    //    sans latence résiduelle de la garde
+    {
+      const m = softStopMachine();
+      let t = 0;
+      for (let i = 0; i < 20; i++) { t += 10; m.step(3.49, 3.49, t); }
+      for (let i = 0; i < 10; i++) { t += 10; m.step(0.8, -0.8, t); } // flip : garde armée
+      // la main arrête le disque : immobilité prolongée (< zone morte 0.2)
+      let firstStopAt = -1;
+      for (let i = 0; i < 120; i++) {
+        t += 10;
+        const before = m.stopped;
+        m.step(0.05, -0.05, t); // quasi immobile, signe non significatif
+        if (m.stopped > before && firstStopAt < 0) firstStopAt = t;
+      }
+      // 300 ms d'immobilité -> garde levée ; puis 350 ms sous le seuil -> arrêt.
+      // La garde armée à t=200 (flip), levée à t≈500, l'arrêt à t≈850.
+      check('backspin puis arrêt : EXACTEMENT 1 arrêt', m.stopped === 1, `${m.stopped} arrêt(s)`);
+      check('backspin puis arrêt : détecté après levée de la garde', firstStopAt > 500 && firstStopAt < 1000, `t=${firstStopAt}`);
     }
   }
 

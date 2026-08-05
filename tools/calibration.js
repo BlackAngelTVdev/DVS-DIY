@@ -527,13 +527,32 @@ export const RELOCK_CONSECUTIVE = 5; // 5 échantillons consécutifs au-dessus d
 // l'arrêt : on recolle à 0 et on attend un vrai geste pour repartir.
 export const STOPPED_RAD_S = 1.0;
 // Durée SOUTENUE sous STOPPED_RAD_S requise pour déclarer un arrêt doux.
-// CRUCIAL pour le scratch : à chaque flip (passage par zéro avant/arrière),
-// la vitesse traverse la zone < 9,5 RPM pendant ~30-60 ms en remontant vers
-// ±33. Sans cette durée, UN SEUL échantillon sous le seuil mettait wasStopped
-// -> le scratch était bloqué à 0.0 en permanence (gyro 20 Hz + envoi 5 s +
-// 50 ms de relock à chaque flip). Un vrai arrêt, lui, reste sous le seuil
-// pendant des centaines de ms -> toujours déclaré.
-export const STOPPED_MS = 120;
+// ⚠️ COMPROMIS PRIORISÉ : le BACKSPIN (la priorité du DJ : "backspine sans
+// que ça coupe parce qu'on passe à 0"). Pendant un backspin, la vitesse
+// traverse la zone < 9,5 RPM en passant par zéro. Un backspin MOYEN traverse
+// en ~100-250 ms, un backspin LENT en ~300 ms. 350 ms couvre la quasi-totalité
+// des gestes réels : dès que la vitesse repart au-dessus de 1,0 rad/s
+// (l'échappatoire `else` du hook remet le chrono à zéro), ce n'était pas un
+// arrêt -> le son ne coupe jamais pendant le backspin.
+// Un VRAI arrêt, lui, reste sous le seuil pendant des centaines de ms à
+// plusieurs secondes -> toujours déclaré (350 ms de délai sur un freinage
+// doux est imperceptible : l'arrêt BRUTAL <10% en 100 ms gère les arrêts nets).
+// Les flips de scratch (< 120 ms) restent aussi sans conséquence.
+export const STOPPED_MS = 350;
+// Fenêtre de NEUTRALISATION des arrêts pendant un BACKSPIN : quand le signe du
+// produit scalaire s'inverse (la rotation passe avant -> arrière) pendant que
+// la vitesse est encore notable, c'est un backspin qui traverse zéro — pas un
+// arrêt. Pendant cette fenêtre, les détections d'arrêt (brutal, doux ET snap
+// d'arrêt anticipé) sont ignorées : le son ne coupe JAMAIS pendant un
+// backspin, même très lent.
+// La garde se RÉ-ARME tant que la platine reste en mouvement dans le sens du
+// backspin (un backspin long est protégé intégralement), et se LÈVE quand la
+// platine redevient VRAIMENT immobile pendant BACKSPIN_CLEAR_MS : un arrêt
+// réel juste après un backspin est alors détecté normalement (pas de latence
+// résiduelle). Un vrai arrêt (platine qui décélère vers 0 sans changer de
+// sens) n'arme jamais la garde.
+export const BACKSPIN_GUARD_MS = 1000;
+export const BACKSPIN_CLEAR_MS = 300; // immobilité requise pour lever la garde
 
 /**
  * Fonction pure du compteur de ré-accrochage : incrémente quand la vitesse

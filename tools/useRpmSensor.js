@@ -33,6 +33,8 @@ import {
   RELOCK_CONSECUTIVE,
   STOPPED_RAD_S,
   STOPPED_MS,
+  BACKSPIN_GUARD_MS,
+  BACKSPIN_CLEAR_MS,
   ZERO_DEADBAND_RAD_S,
   CALIBRATION_TIMINGS,
 } from './calibration';
@@ -121,6 +123,16 @@ export function useRpmSensor() {
   const motionSnapCountRef = useRef(0);         // compteur du motion snap (2 échantillons requis : filtre anti-impulsion)
   const stopCandidateStartRef = useRef(null);   // instant du 1er échantillon sous le seuil d'arrêt
   const stoppedStartRef = useRef(null);         // instant du 1er échantillon SOUTENU sous STOPPED_RAD_S
+  const lastSignRef = useRef(0);                // dernier sens SIGNIFICATIF de rotation (-1/0/1)
+  const backspinUntilRef = useRef(0);           // les arrêts sont neutralisés jusqu'à ce timestamp
+  const backspinRestStartRef = useRef(null);    // début de l'immobilité (pour lever la garde)
+  // (un backspin traverse zéro : le signe du dot s'inverse pendant que la
+  // vitesse est encore notable. Un vrai arrêt, lui, garde le même sens. On
+  // neutralise les détections d'arrêt (brutal + doux + anticipé) pendant un
+  // backspin : le son ne coupe JAMAIS, même s'il est lent. La garde se ré-arme
+  // tant que la platine bouge dans le sens du backspin, et se lève quand elle
+  // redevient vraiment immobile -> un arrêt réel après un backspin est
+  // détecté normalement.)
   const slowStopStartRef = useRef(null);        // instant du 1er échantillon sous l'écart d'arrêt anticipé
   const lastLogTimeRef = useRef(0);             // pour limiter la fréquence des logs
   const standardSpeedRef = useRef(33.33);       // miroir de standardSpeed pour le callback gyro
@@ -242,6 +254,9 @@ export function useRpmSensor() {
     motionSnapCountRef.current = 0;
     stopCandidateStartRef.current = null;
     stoppedStartRef.current = null;
+    lastSignRef.current = 0;
+    backspinUntilRef.current = 0;
+    backspinRestStartRef.current = null;
     slowStopStartRef.current = null;
     setRpm(0);
     rpmRef.current = 0;
@@ -357,6 +372,41 @@ export function useRpmSensor() {
         corrected.z * axisVectorRef.current.z;
       const absSpeed = Math.abs(dot);
 
+      // --- Backspin : le signe du produit scalaire s'inverse ---
+      // Un backspin traverse zéro : la rotation passe avant -> arrière, le
+      // signe du dot change pendant que la vitesse est encore notable. Un vrai
+      // arrêt, lui, garde le même sens (la platine décélère vers 0 et s'y
+      // arrête). Quand on détecte ce flip, on neutralise les détections
+      // d'arrêt (brutal + doux + anticipé) pendant BACKSPIN_GUARD_MS. La garde
+      // se RÉ-ARME à chaque échantillon tant que la platine bouge dans le sens
+      // du backspin (un backspin long est protégé en entier) et se LÈVE quand
+      // la platine redevient VRAIMENT immobile pendant BACKSPIN_CLEAR_MS (un
+      // arrêt réel juste après un backspin est détecté normalement, pas de
+      // latence résiduelle). Le signe n'est pris en compte que hors zone morte
+      // (le bruit autour de 0 ne déclenche pas de faux backspin) et on ne
+      // considère que les changements depuis un sens ÉTABLI (pas depuis
+      // l'arrêt).
+      if (absSpeed > ZERO_DEADBAND_RAD_S) {
+        const sign = dot >= 0 ? 1 : -1;
+        if (lastSignRef.current !== 0 && lastSignRef.current !== sign) {
+          // flip de sens : c'est un backspin -> on neutralise les arrêts
+          backspinUntilRef.current = now + BACKSPIN_GUARD_MS;
+        } else if (backspinUntilRef.current > now) {
+          // toujours dans le backspin (même sens, en mouvement) : on prolonge
+          backspinUntilRef.current = now + BACKSPIN_GUARD_MS;
+        }
+        lastSignRef.current = sign;
+        backspinRestStartRef.current = null; // en mouvement : pas d'immobilité
+      } else if (absSpeed < ZERO_DEADBAND_RAD_S && backspinUntilRef.current > now) {
+        // immobilité réelle : si elle dure, la platine s'est VRAIMENT arrêtée
+        // après le backspin -> on lève la garde pour que l'arrêt soit détecté
+        if (backspinRestStartRef.current === null) backspinRestStartRef.current = now;
+        else if (now - backspinRestStartRef.current >= BACKSPIN_CLEAR_MS) {
+          backspinUntilRef.current = 0;
+          backspinRestStartRef.current = null;
+        }
+      }
+
       // --- Détection d'arrêt brutal ---
       // Si ça tournait à une vitesse significative et que ça chute d'un coup
       // à moins de 10% de cette vitesse, la platine vient de s'arrêter net.
@@ -367,7 +417,8 @@ export function useRpmSensor() {
       if (
         fastSpeedTrackerRef.current !== null &&
         fastSpeedTrackerRef.current > STOP_DETECTION_MIN_RAD_S &&
-        absSpeed < fastSpeedTrackerRef.current * STOP_DETECTION_RATIO
+        absSpeed < fastSpeedTrackerRef.current * STOP_DETECTION_RATIO &&
+        now >= backspinUntilRef.current // backspin : jamais d'arrêt brutal
       ) {
         // Chute SOUTENUE pendant ~100 ms (durée réelle, pas un compteur
         // d'échantillons : à 100 Hz, 2 échantillons = 20 ms, ce qui serait
@@ -435,12 +486,14 @@ export function useRpmSensor() {
           setGyroRate(true);    // et gyro 100 Hz (réactivité)
           console.log('[RPM] Vrai mouvement détecté -> ré-accrochage direct');
         }
-      } else if (absSpeed < STOPPED_RAD_S) {
-        // Arrêt DOUX : doit être SOUTENU (~120 ms). Un flip de scratch traverse
-        // brièvement cette zone en remontant vers ±33 -> il ne doit PAS mettre
-        // wasStopped (sinon chaque passage par zéro couperait le son et le
-        // scratch serait bloqué à 0.0). On ne déclare l'arrêt que si la vitesse
-        // reste réellement sous le seuil pendant STOPPED_MS.
+      } else if (absSpeed < STOPPED_RAD_S && now >= backspinUntilRef.current) {
+        // Arrêt DOUX : doit être SOUTENU (STOPPED_MS). Un flip de scratch
+        // traverse brièvement cette zone en remontant vers ±33, un backspin la
+        // traverse en changeant de sens : ni l'un ni l'autre ne doit mettre
+        // wasStopped (sinon coupure du son). La garde backspinUntilRef couvre
+        // les backspins lents ; STOPPED_MS couvre le reste. On ne déclare
+        // l'arrêt que si la vitesse reste réellement sous le seuil pendant
+        // STOPPED_MS.
         if (stoppedStartRef.current === null) stoppedStartRef.current = now;
         if (now - stoppedStartRef.current >= STOPPED_MS) {
           stoppedStartRef.current = null;
@@ -535,7 +588,11 @@ export function useRpmSensor() {
       // rocking, dont l'écart max mesuré ~15,5 RPM reste sous les 20) : on
       // accroche l'estimé au suivi rapide pour suivre en temps réel, puis 0
       // dès que < STOPPED_RAD_S.
-      if (!wasStoppedRef.current && estRpm - rawRpmSigned > SLOW_STOP_GAP_RPM) {
+      if (
+        !wasStoppedRef.current &&
+        now >= backspinUntilRef.current && // backspin : pas de snap d'arrêt anticipé non plus
+        estRpm - rawRpmSigned > SLOW_STOP_GAP_RPM
+      ) {
         if (slowStopStartRef.current === null) slowStopStartRef.current = now;
         if (now - slowStopStartRef.current >= SLOW_STOP_MS) {
           slowStopStartRef.current = null;
