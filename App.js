@@ -20,10 +20,13 @@ export default function App() {
     sendStatus,
     sensorError,
     gain,
+    standardSpeed,
+    stability,
     startBiasCalibration,
     startMeasuring,
     stop,
     testSend,
+    setStandardSpeed,
   } = useRpmSensor();
 
   return (
@@ -36,6 +39,9 @@ export default function App() {
       sendStatus={sendStatus}
       sensorError={sensorError}
       gain={gain}
+      standardSpeed={standardSpeed}
+      stability={stability}
+      onSelectSpeed={setStandardSpeed}
       onStartBiasCalibration={startBiasCalibration}
       onStartMeasuring={startMeasuring}
       onStop={stop}

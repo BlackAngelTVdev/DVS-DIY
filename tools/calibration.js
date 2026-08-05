@@ -196,9 +196,50 @@ export function autoCorrectGain(gain, speedRpm, alpha = 0.008) {
   const s = Math.abs(speedRpm);
   if (s < 10) return gain; // pas à l'arrêt
   const target = closestStandard(s);
-  if (Math.abs(s - target) > target * GAIN_BAND) return gain; // hors bande : on ne touche pas
+  if (Math.abs(s - target) > target * GAIN_BAND) {
+    // Hors bande : on ne corrige PAS vers la standard (respect du pitch
+    // volontaire du DJ), MAIS si le gain s'est écarté de 1 (ex: gain
+    // instantané erroné de la détection d'axe), on le ramène doucement
+    // vers 1 -> une erreur ne peut jamais rester verrouillée.
+    if (Math.abs(gain - 1) > 0.01) {
+      return gain > 1 ? Math.max(1, gain - alpha * 0.5) : Math.min(1, gain + alpha * 0.5);
+    }
+    return gain;
+  }
   const corrected = s * gain;
   return Math.min(GAIN_MAX, Math.max(GAIN_MIN, gain + alpha * (target - corrected) / target));
+}
+
+// --- Gain INSTANTANÉ à partir des échantillons de la détection d'axe ---
+// Pendant la détection d'axe (~1,5 s), le téléphone tourne déjà sur la
+// platine. On connaît donc la vitesse mesurée AVANT de commencer la mesure :
+// si elle est proche d'une vitesse standard, on en déduit immédiatement le
+// facteur d'échelle du gyro (standard / mesuré). L'utilisateur voit ~33.3
+// dès la première seconde, au lieu d'attendre les ~20 s du recalage lent.
+//
+// Robustesse :
+//  - percentile 30 des magnitudes (la montée en vitesse et le "rocking"
+//    gonflent la norme -> on reste sous la valeur, jamais au-dessus)
+//  - bande ±15% : une vitesse non standard (rampe, tenue à la main à 20 RPM)
+//    ne calibre RIEN -> le recalage lent prend le relais.
+export const AXIS_GAIN_MIN = 0.9;
+export const AXIS_GAIN_MAX = 1.15;
+// Bande ±15% : assez large pour accepter le cas réel (gyro qui lit 31.5 pour
+// une platine à 33.33, avec le bruit du capteur) et rejeter les vitesses non
+// standards (rampe, tenue à la main à 20 RPM). Un gain erroné n'est pas
+// verrouillé : autoCorrectGain le ramène vers 1 s'il sort de sa propre bande.
+export const AXIS_GAIN_BAND = 0.15; // ±15% autour d'une vitesse standard
+
+export function estimateGainFromSamples(samples, { band = AXIS_GAIN_BAND } = {}) {
+  if (samples.length < 4) return 1; // pas assez d'échantillons
+  const mags = samples.map(computeMagnitude).sort((a, b) => a - b);
+  const p30 = mags[Math.min(mags.length - 1, Math.floor(mags.length * 0.3))];
+  const rpm = p30 * (60 / (2 * Math.PI));
+  if (rpm < 10) return 1; // pas en rotation
+  const target = closestStandard(rpm);
+  const ratio = rpm / target;
+  if (Math.abs(ratio - 1) > band) return 1; // vitesse non standard : on ne calibre pas
+  return Math.min(AXIS_GAIN_MAX, Math.max(AXIS_GAIN_MIN, 1 / ratio));
 }
 
 /**

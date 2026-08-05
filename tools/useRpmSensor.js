@@ -15,6 +15,7 @@ import {
   detectRotationAxis,
   createSmoother,
   autoCorrectGain,
+  estimateGainFromSamples,
   detectRelease,
   relockStep,
   RELOCK_CONSECUTIVE,
@@ -23,7 +24,7 @@ import {
   ZERO_DEADBAND_RAD_S,
   CALIBRATION_TIMINGS,
 } from './calibration';
-import { createSpeedSender } from './speedSender';
+import { createSpeedSender, SEND_INTERVAL_MS, SLOW_INTERVAL_MS } from './speedSender';
 
 const { BIAS_CALIBRATION_MS, AXIS_CALIBRATION_MS } = CALIBRATION_TIMINGS;
 
@@ -69,6 +70,8 @@ export function useRpmSensor() {
   const [sendStatus, setSendStatus] = useState('idle'); // idle | ok | error
   const [sensorError, setSensorError] = useState(null); // toute erreur capteur -> affichée à l'écran
   const [gain, setGain] = useState(1); // recalage auto (affiché dans l'UI)
+  const [standardSpeed, setStandardSpeedState] = useState(33.33); // vitesse cible choisie (33/45/78)
+  const [stability, setStability] = useState(0); // ± déviation récente du RPM lissé (affiché dans l'UI)
 
   const gyroSubRef = useRef(null);
   const accelSubRef = useRef(null);
@@ -96,6 +99,9 @@ export function useRpmSensor() {
   const fastSpeedTrackerRef = useRef(null);     // suivi rapide pour détecter les arrêts brutaux
   const stopCandidateCountRef = useRef(0);      // échantillons consécutifs sous le seuil d'arrêt
   const lastLogTimeRef = useRef(0);             // pour limiter la fréquence des logs
+  const standardSpeedRef = useRef(33.33);       // miroir de standardSpeed pour le callback gyro
+  const stabilityRingRef = useRef([]);          // dernières valeurs lissées -> déviation
+  const cadenceRef = useRef('fast');            // cadence d'envoi (fast 200 ms / slow 5 s)
 
   const rpmRef = useRef(0); // toujours à jour, lu par le sender indépendamment du re-render
 
@@ -118,6 +124,23 @@ export function useRpmSensor() {
       senderRef.current.stop();
     };
   }, []);
+
+  // Cadence adaptative : 200 ms en rotation, 5 s à l'arrêt (batterie/Wi-Fi).
+  // Ne recrée l'intervalle QUE si la cadence change vraiment.
+  const setSendCadence = (fast) => {
+    const key = fast ? 'fast' : 'slow';
+    if (cadenceRef.current === key) return;
+    cadenceRef.current = key;
+    senderRef.current.setIntervalMs(fast ? SEND_INTERVAL_MS : SLOW_INTERVAL_MS);
+    console.log(`[RPM] Cadence d'envoi : ${fast ? '200 ms (rotation)' : '5 s (arrêt)'}`);
+  };
+
+  // Vitesse standard cible (33/45/78) choisie dans l'UI. Utilisée pour
+  // l'affichage et comme cible préférée du relâchement.
+  const setStandardSpeed = (v) => {
+    standardSpeedRef.current = v;
+    setStandardSpeedState(v);
+  };
 
   // --- Étape 1 : calibration du biais, téléphone immobile ---
   const startBiasCalibration = () => {
@@ -162,6 +185,8 @@ export function useRpmSensor() {
     stopCandidateCountRef.current = 0;
     setRpm(0);
     rpmRef.current = 0;
+    stabilityRingRef.current = [];
+    setStability(0);
 
     axisSamplesRef.current = [];
     axisStartRef.current = Date.now();
@@ -226,8 +251,24 @@ export function useRpmSensor() {
 
           axisVectorRef.current = vector;
           setDominantAxisLabel(label);
+
+          // Gain INSTANTANÉ : les échantillons d'axe ont été capturés pendant
+          // la rotation -> on déduit le facteur d'échelle du gyro tout de
+          // suite (33.3 dès la 1re seconde, au lieu de ~20 s).
+          const gainInstant = estimateGainFromSamples(axisSamplesRef.current);
+          if (gainInstant !== 1) {
+            gainRef.current = gainInstant;
+            setGain(gainInstant);
+            console.log(`[RPM] Gain pré-calibré pendant l'axe : ${gainInstant.toFixed(3)}`);
+          }
+
           console.log(`[RPM] Axe détecté (${label}) -> phase measuring, envoi démarré`);
           setPhase('measuring');
+          // Force la cadence RAPIDE réelle : l'intervalle interne du sender a
+          // pu être passé à 5 s par un arrêt précédent (bug : sans ça, un
+          // setSendCadence(true) était neutralisé par le garde-fou cadenceRef).
+          cadenceRef.current = 'slow';
+          setSendCadence(true);
           senderRef.current.start();
         }
         return;
@@ -269,6 +310,7 @@ export function useRpmSensor() {
           setRpm(0);
           rpmRef.current = 0;
           senderRef.current.sendNow(0);
+          setSendCadence(false); // platine arrêtée : on ralentit l'envoi (5 s)
           console.log('[RPM] Arrêt brutal détecté -> reset immédiat à 0');
         }
         return;
@@ -309,6 +351,7 @@ export function useRpmSensor() {
             smootherRef.current.snapTo(absSpeed * (60 / (2 * Math.PI)));
             relockCountRef.current = 0;
             wasStoppedRef.current = false;
+            setSendCadence(true); // la platine tourne de nouveau : envoi rapide
             console.log('[RPM] Vrai mouvement détecté -> ré-accrochage direct');
           }
         }
@@ -320,6 +363,7 @@ export function useRpmSensor() {
         smootherRef.current.snapTo(0);
         setRpm(0);
         rpmRef.current = 0;
+        setSendCadence(false); // économie batterie à l'arrêt
       }
 
       const direction = absSpeed < ZERO_DEADBAND_RAD_S ? 0 : dot >= 0 ? 1 : -1;
@@ -342,9 +386,13 @@ export function useRpmSensor() {
       const { near, rawAway } = detectRelease(axialRpm, rawRpm);
       let rpmBrut = axialRpm;
       if (releaseAwayRef.current && near && !releaseNearPrevRef.current) {
-        const cible = closestStandard(rawRpm);
+        // cible = vitesse standard choisie dans l'UI si la platine y revient,
+        // sinon la standard la plus proche de la vitesse réelle
+        const sel = standardSpeedRef.current;
+        const cible = Math.abs(rawRpm - sel) <= sel * 0.06 ? sel : closestStandard(rawRpm);
         smootherRef.current.snapTo(cible / gainRef.current);
         rpmBrut = cible / gainRef.current;
+        setSendCadence(true);
         console.log(`[RPM] Platine relâchée -> accrochage direct à ${cible.toFixed(1)} RPM`);
       }
       releaseCountRef.current = rawAway ? Math.min(50, releaseCountRef.current + 1) : 0;
@@ -367,6 +415,17 @@ export function useRpmSensor() {
         // Recalage continu du gain vers la vitesse standard (33/45/78)
         gainRef.current = autoCorrectGain(gainRef.current, axialRpm);
         setGain(gainRef.current);
+
+        // Stabilité affichée : déviation du RPM BRUT (suivi rapide) sur les
+        // ~3 dernières s -> indicateur réel de la fixation du téléphone (le
+        // lissé serait quasi constant et ne dirait rien).
+        stabilityRingRef.current.push((fastSpeedTrackerRef.current ?? 0) * (60 / (2 * Math.PI)));
+        if (stabilityRingRef.current.length > 6) stabilityRingRef.current.shift();
+        if (stabilityRingRef.current.length >= 2) {
+          const min = Math.min(...stabilityRingRef.current);
+          const max = Math.max(...stabilityRingRef.current);
+          setStability((max - min) / 2);
+        }
         console.log(
           `[RPM] lissé: ${(direction * axialRpm * gainRef.current).toFixed(2)} | brut: ${(absSpeed * (60 / (2 * Math.PI))).toFixed(2)} | gain: ${gainRef.current.toFixed(3)} | axe: ${axisVectorRef.current.x.toFixed(2)},${axisVectorRef.current.y.toFixed(2)},${axisVectorRef.current.z.toFixed(2)} | rejets: ${rejectedRef.current}`
         );
@@ -408,10 +467,13 @@ export function useRpmSensor() {
     sendStatus,
     sensorError,
     gain,
+    standardSpeed,
+    stability,
     // actions
     startBiasCalibration,
     startMeasuring,
     stop,
     testSend,
+    setStandardSpeed,
   };
 }

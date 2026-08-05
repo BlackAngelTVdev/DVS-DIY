@@ -20,6 +20,7 @@ const {
   detectRotationAxis,
   createSmoother,
   autoCorrectGain,
+  estimateGainFromSamples,
   detectRelease,
   relockStep,
   RELOCK_MIN_RAD_S,
@@ -28,6 +29,11 @@ const {
   ZERO_DEADBAND_RAD_S,
   CALIBRATION_TIMINGS,
 } = await import(`file://${modPath}`);
+
+// speedSender.js est aussi en ESM : même copie vers un .mjs temporaire
+const senderModPath = join(dir, 'speedSender.mjs');
+writeFileSync(senderModPath, readFileSync(fileURLToPath(new URL('./speedSender.js', import.meta.url)), 'utf8'));
+const { createSpeedSender, SLOW_INTERVAL_MS } = await import(`file://${senderModPath}`);
 
 try {
   const RAD2RPM = 60 / (2 * Math.PI);
@@ -317,6 +323,40 @@ try {
     let g5 = 1.2;
     g5 = autoCorrectGain(g5, 33.33);
     check('gain clampé à 1.12 max', g5 <= 1.12, g5.toFixed(3));
+
+    // f) gain erroné (ex: gain instantané posé pendant l'axe à 30 RPM) qui
+    //    pousse la lecture hors bande -> il DOIT décroître vers 1, jamais
+    //    d'erreur verrouillée
+    let g6 = 1.11;
+    for (let i = 0; i < 5000; i++) g6 = autoCorrectGain(g6, 37.0); // lecture corrigée hors bande
+    check('gain erroné hors bande -> revient vers 1 (pas de verrou)', close(g6, 1.0, 0.02), g6.toFixed(3));
+  }
+
+  // --- 4b. Gain INSTANTANÉ pendant la détection d'axe ---
+  // (plus besoin d'attendre ~20 s : le facteur d'échelle est déduit tout de
+  // suite des échantillons capturés pendant la rotation d'axe)
+  console.log('\n[4b] Gain instantané (estimateGainFromSamples)');
+  {
+    const rad2rpm = (rpm) => (rpm * 2 * Math.PI) / 60;
+    const spin = (rpm) =>
+      Array.from({ length: 40 }, () => ({ x: noise(0.01), y: noise(0.01), z: rad2rpm(rpm) + noise(0.05) }));
+
+    const g1 = estimateGainFromSamples(spin(31.5));
+    check('gyro lit 31.5 (platine à 33.33) -> gain ~1.058', close(g1, 33.33 / 31.5, 0.01), g1.toFixed(4));
+
+    const g2 = estimateGainFromSamples(spin(33.3));
+    check('33.3 mesuré -> gain ~1.000', close(g2, 1, 0.01), g2.toFixed(4));
+
+    const g3 = estimateGainFromSamples(spin(45));
+    check('45 mesuré -> gain ~1.000', close(g3, 1, 0.01), g3.toFixed(4));
+
+    check('20 RPM (hors bande, tenue à la main) -> gain 1', estimateGainFromSamples(spin(20)) === 1);
+
+    const stopped = Array.from({ length: 40 }, () => ({ x: noise(0.01), y: noise(0.01), z: noise(0.01) }));
+    check('à l\'arrêt -> gain 1 (pas de fausse calibration)', estimateGainFromSamples(stopped) === 1);
+
+    const few = [{ x: 0, y: 0, z: RPM33 }, { x: 0, y: 0, z: RPM33 }, { x: 0, y: 0, z: RPM33 }];
+    check('3 échantillons seulement -> gain 1', estimateGainFromSamples(few) === 1);
   }
 
   // --- 5. Relâchement de la platine (backspin/arrêt -> retour à 33 direct) ---
@@ -439,6 +479,38 @@ try {
       check('vrai scratch : accroche en <4 échantillons après le début du geste', firstHigh >= 70 && firstHigh <= 73, `index ${firstHigh}`);
       check('vrai scratch : valeur finale ~33.3', close(end, 33.33, 1.5), end.toFixed(1));
     }
+  }
+
+  // --- 9. Cadence adaptative de l'envoi (batterie) ---
+  console.log('\n[9] Cadence adaptative (speedSender)');
+  {
+    check('SLOW_INTERVAL_MS = 5000 (5 s à l\'arrêt)', SLOW_INTERVAL_MS === 5000);
+
+    // vers 127.0.0.1:9 (port fermé) : connexion refusée instantanément,
+    // onError est appelé à chaque tick -> on compte les tentatives.
+    // setIntervalMs AVANT start : ne doit pas crasher ni créer d'intervalle
+    const pre = createSpeedSender(() => 0, { ip: '127.0.0.1', port: 9 });
+    pre.setIntervalMs(5000);
+    pre.stop();
+    check('setIntervalMs avant start : pas de crash', true);
+
+    let tried = 0;
+    const sender = createSpeedSender(() => 0, {
+      ip: '127.0.0.1',
+      port: 9,
+      intervalMs: 40,
+      onSuccess: () => tried++,
+      onError: () => tried++,
+    });
+
+    sender.start();
+    await new Promise((r) => setTimeout(r, 300)); // laisser le 1er fetch échouer (20 ms)
+    const fastTicks = tried;
+    check('cadence rapide : des envois partent (échec de connexion = tick)', fastTicks >= 1, `ticks=${fastTicks}`);
+    sender.setIntervalMs(30); // changement de cadence en cours de route : pas de crash
+    sender.setIntervalMs(2000);
+    sender.stop();
+    check('setIntervalMs pendant le run : pas de crash', true);
   }
 
   console.log(`\n===== ${pass} OK / ${fail} ECHEC =====`);

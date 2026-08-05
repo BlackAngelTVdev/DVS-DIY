@@ -20,7 +20,12 @@ export const SERVER_IP = '192.168.1.140';
 const SERVER_PORT = 5005;
 const REFERENCE_RPM = 33.33; // 1.0 = cette vitesse
 
-const SEND_INTERVAL_MS = 200; // 5 Hz : optimisé batterie (Wi-Fi radio), reste 2,5x sous le timeout 0,5 s
+export const SEND_INTERVAL_MS = 200; // 5 Hz : optimisé batterie (Wi-Fi radio), reste 2,5x sous le timeout 0,5 s
+// Quand la platine est à l'arrêt, on n'a pas besoin de maintenir 5 Hz : un
+// heartbeat toutes les 5 s suffit (le serveur ne coupe rien : la vitesse est
+// déjà à 0 et il ne logue pas les timeouts à l'arrêt). Économie Wi-Fi majeure
+// quand le téléphone reste posé sur une platine éteinte.
+export const SLOW_INTERVAL_MS = 5000;
 
 /**
  * Crée un "sender" qui interroge en continu la dernière valeur de RPM
@@ -41,10 +46,11 @@ export function createSpeedSender(getRpmValue, options = {}) {
     ip = SERVER_IP,
     port = SERVER_PORT,
     referenceRpm = REFERENCE_RPM,
-    intervalMs = SEND_INTERVAL_MS,
+    intervalMs: initialInterval = SEND_INTERVAL_MS,
     onError = null, // callback optionnel (err) => void
     onSuccess = null, // callback optionnel (ratio) => void
   } = options;
+  let intervalMs = initialInterval; // modifiable (cadence adaptative arrêt/rotation)
 
   const url = `http://${ip}:${port}/`;
   let intervalId = null;
@@ -99,5 +105,14 @@ export function createSpeedSender(getRpmValue, options = {}) {
     },
     // Permet d'envoyer une valeur ponctuelle immédiatement (ex: pour tester)
     sendNow: sendOnce,
+    // Cadence adaptative : réduit la radio au repos (5 s à l'arrêt) et
+    // repasse en 200 ms dès que la platine tourne.
+    setIntervalMs(ms) {
+      intervalMs = ms;
+      if (intervalId !== null) {
+        clearInterval(intervalId);
+        intervalId = setInterval(sendOnce, intervalMs);
+      }
+    },
   };
 }

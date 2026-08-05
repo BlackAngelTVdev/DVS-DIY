@@ -8,7 +8,6 @@
 import React, { useEffect, useRef } from 'react';
 import { View, Text, StyleSheet, Animated, Pressable, Easing } from 'react-native';
 import { SERVER_IP } from './speedSender';
-import { closestStandard } from './calibration';
 
 const C = {
   bg: '#08080d',
@@ -115,6 +114,9 @@ export default function RpmDisplay({
   sendStatus,
   sensorError,
   gain,
+  standardSpeed,
+  stability,
+  onSelectSpeed,
   onStartBiasCalibration,
   onStartMeasuring,
   onStop,
@@ -161,10 +163,27 @@ export default function RpmDisplay({
 
         {isMeasuring && rpm > 0 && (
           <Text style={styles.hint}>
-            cible : {closestStandard(rpm).toFixed(1)} RPM {Math.abs(rpm - closestStandard(rpm)) < 1.5 ? '· stable' : '· en stabilisation'}
+            cible {standardSpeed.toFixed(1)} RPM · ±{stability.toFixed(1)} · {Math.abs(rpm - standardSpeed) < 2 ? 'stable' : 'en stabilisation'}
           </Text>
         )}
       </View>
+
+      {/* sélecteur de vitesse standard (33/45/78) */}
+      {(phase === 'idle' || phase === 'readyToSpin' || isMeasuring) && (
+        <View style={styles.speedBlock}>
+          <Text style={styles.speedLabel}>VITESSE CIBLE</Text>
+          <View style={styles.speedRow}>
+            {[33.33, 45, 78].map((s) => {
+              const on = Math.abs(standardSpeed - s) < 0.01;
+              return (
+                <Pressable key={s} onPress={() => onSelectSpeed(s)} style={[styles.speedBtn, on && styles.speedBtnOn]}>
+                  <Text style={[styles.speedBtnText, on && styles.speedBtnTextOn]}>{s === 33.33 ? '33' : s}</Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        </View>
+      )}
 
       {/* stepper de phases */}
       <View style={styles.stepper}>
@@ -312,6 +331,42 @@ const styles = StyleSheet.create({
     color: C.faint,
     fontSize: 12,
     marginTop: 8,
+  },
+  speedBlock: {
+    width: '100%',
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  speedLabel: {
+    color: C.faint,
+    fontSize: 10,
+    letterSpacing: 2,
+    marginBottom: 6,
+  },
+  speedRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  speedBtn: {
+    width: 64,
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: C.border,
+    backgroundColor: C.panel2,
+    alignItems: 'center',
+  },
+  speedBtnOn: {
+    borderColor: C.cyan,
+    backgroundColor: '#06222b',
+  },
+  speedBtnText: {
+    color: C.dim,
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  speedBtnTextOn: {
+    color: C.cyan,
   },
   stepper: {
     width: '100%',
