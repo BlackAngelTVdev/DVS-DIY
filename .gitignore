@@ -1,42 +1,77 @@
-# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+# ============================================================
+# DVS DIY — PhaseApp
+# ============================================================
 
-# dependencies
+# ---------- Node / npm ----------
 node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tgz
 
-# Expo
+# ---------- Expo / Metro ----------
 .expo/
+.expo-shared/
 dist/
 web-build/
 expo-env.d.ts
-
-# Native
-.kotlin/
+.metro-health-check*
 *.orig.*
+
+# ---------- Générés natifs (expo prebuild / run) ----------
+/ios
+/android
+.kotlin/
 *.jks
 *.p8
 *.p12
 *.key
 *.mobileprovision
 
-# Metro
-.metro-health-check*
+# ---------- Python (pi-server) ----------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# debug
-npm-debug.*
-yarn-debug.*
-yarn-error.*
+# ---------- Runtime serveur Pi (jamais dans git) ----------
+dvs.log
+nohup.out
+# gros fichier audio : reste sur le Pi, hors git
+timecode.wav
+pi-server/timecode.wav
 
-# macOS
+# ---------- Environnement / secrets ----------
+.env
+.env.*
+!.env.example
+
+# ---------- Local Freebuff (base locale) ----------
+.freebuff/
+
+# ---------- IDE / éditeurs ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.ionide/
+
+# ---------- OS ----------
 .DS_Store
+Thumbs.db
+Desktop.ini
 *.pem
 
-# local env files
-.env*.local
-
-# typescript
+# ---------- TypeScript ----------
 *.tsbuildinfo
 
-# generated native folders
-/ios
-/android
-.*/
+# ---------- Logs divers ----------
+*.log
