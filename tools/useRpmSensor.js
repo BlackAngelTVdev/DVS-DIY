@@ -17,6 +17,7 @@ import {
   autoCorrectGain,
   detectRelease,
   relockStep,
+  RELOCK_CONSECUTIVE,
   STOPPED_RAD_S,
   closestStandard,
   ZERO_DEADBAND_RAD_S,
