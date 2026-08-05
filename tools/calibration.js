@@ -281,7 +281,11 @@ export function createStableOutput({ sampleMs = 10 } = {}) {
 // temps réel. Le wobble du rocking (écart max mesuré ~15,5 RPM avec bruit ±37%)
 // reste SOUS 20 : aucun faux déclenchement en rotation stable.
 export const SLOW_STOP_GAP_RPM = 20;
-export const SLOW_STOP_MS = 100;
+export const SLOW_STOP_MS = 200;
+// Durée SOUTENUE de l'écart requise pour le snap d'arrêt anticipé. Portée à
+// 200 ms : un creux transitoire du wobble (60-120 ms) ne déclenche plus le
+// snap (sinon pic de ralentissement envoyé au Pi), alors qu'un vrai freinage
+// de la platine maintient l'écart > 20 pendant des centaines de ms.
 
 export function createPhaseEstimator({ windowMs = ESTIMATOR_WINDOW_MS, sampleMs = 50 } = {}) {
   const RAD2RPM = 60 / (2 * Math.PI);
@@ -480,11 +484,30 @@ export function detectRelease(smoothedRpm, rawRpm, band = RELEASE_BAND, target =
 // détection en rotation stable, ET un geste MODÉRÉ (poussée à ~54 RPM,
 // décélération franche) franchit le seuil et suit la main immédiatement.
 export const MOTION_SNAP_RPM = 20;
-// Le snap exige 2 échantillons CONSÉCUTIFS (20 ms à 100 Hz) : une impulsion
-// de bruit isolée qui dépasserait brièvement 20 RPM ne doit pas injecter le
-// wobble dans la sortie lissée (un faux snap ferait sauter l'affichage au
-// pic du wobble). Un geste réel dure des dizaines de ms -> toujours déclenché.
-export const MOTION_SNAP_CONSECUTIVE = 2;
+// Le snap exige une PERSISTANCE pour les déviations MÊME-SIGNE : 12 échantillons
+// (120 ms à 100 Hz). Un creux transitoire du wobble (le raw plonge brièvement
+// à 8-12 RPM, dure 60-120 ms) ne doit PAS injecter le creux dans la sortie
+// lissée (faux snap -> pic de ralentissement envoyé au Pi). Un vrai geste
+// (poussée, freinage) dure des centaines de ms -> toujours déclenché.
+// Les FLIPS (passage au signe opposé = scratch/backspin réel) snappent en 2
+// échantillons : la main traverse le zéro, il n'y a aucune ambiguïté avec un
+// creux de wobble (qui, lui, garde le signe de la rotation). UNE CONDITION :
+// la magnitude doit dépasser MOTION_SNAP_FLIP_MIN_RPM (~19 RPM). Un creux du
+// wobble qui franchirait brièvement zéro (axe mal calibré, rocking violent)
+// reste de petite magnitude (< 19) -> pas un vrai flip -> pas de pic négatif
+// envoyé. Un vrai scratch/backspin repart toujours à ±20-33 RPM.
+export const MOTION_SNAP_CONSECUTIVE = 12;  // persistance déviation même-signe (120 ms)
+export const MOTION_SNAP_FLIP_CONSECUTIVE = 2; // flip (signe opposé) : snap immédiat (20 ms)
+export const MOTION_SNAP_FLIP_MIN_RPM = 19; // magnitude minimale d'un vrai flip (~19 RPM)
+// RE-SNAP : quand on est déjà en fenêtre RAPIDE (juste après un snap), on
+// continue de suivre la main avec un seuil réduit et 2 échantillons. C'est ce
+// qui permet au scratch de suivre les flips successifs et à la sortie de
+// remonter vite quand la main relâche (retour à 33 immédiat). Le seuil réduit
+// (16) reste AU-DESSUS du wobble résiduel (déviation max mesurée ~15,5 avec
+// l'harmonique 1,7 Hz) : pas de faux re-snap en rotation stable, mais un retour
+// de geste (écart > 30-50) rattrape tout de suite.
+export const MOTION_SNAP_RESNAP_RPM = 16;
+export const MOTION_SNAP_RESNAP_CONSECUTIVE = 2;
 
 // --- Ré-accrochage après arrêt : il faut un VRAI geste ---
 // Le ré-accrochage (relock) après un arrêt se déclenche quand la platine

@@ -26,7 +26,12 @@ const {
   relockStep,
   MOTION_SNAP_RPM,
   MOTION_SNAP_CONSECUTIVE,
+  MOTION_SNAP_FLIP_CONSECUTIVE,
+  MOTION_SNAP_FLIP_MIN_RPM,
+  MOTION_SNAP_RESNAP_RPM,
+  MOTION_SNAP_RESNAP_CONSECUTIVE,
   STOPPED_MS,
+  SLOW_STOP_MS,
   ESTIMATOR_WINDOW_MS,
   ESTIMATOR_FAST_WINDOW_MS,
   ESTIMATOR_FAST_HOLD_MS,
@@ -497,8 +502,13 @@ try {
   check('RELOCK_MIN_RAD_S = 2.0 (~19,1 RPM, backspin moyen ré-accroche)', RELOCK_MIN_RAD_S === 2.0, `actuel: ${RELOCK_MIN_RAD_S}`);
   check('RELOCK_CONSECUTIVE = 5 échantillons (~50 ms, filtre micro-geste)', RELOCK_CONSECUTIVE === 5, `actuel: ${RELOCK_CONSECUTIVE}`);
   check('MOTION_SNAP_RPM = 20 (> wobble max ~12-15, < geste modéré)', MOTION_SNAP_RPM === 20, `actuel: ${MOTION_SNAP_RPM}`);
-  check('MOTION_SNAP_CONSECUTIVE = 2 (filtre les impulsions de bruit > 20)', MOTION_SNAP_CONSECUTIVE === 2, `actuel: ${MOTION_SNAP_CONSECUTIVE}`);
+  check('MOTION_SNAP_CONSECUTIVE = 12 (~120 ms, creux transitoire < geste réel)', MOTION_SNAP_CONSECUTIVE === 12, `actuel: ${MOTION_SNAP_CONSECUTIVE}`);
+  check('MOTION_SNAP_FLIP_CONSECUTIVE = 2 (flip de scratch -> snap immédiat)', MOTION_SNAP_FLIP_CONSECUTIVE === 2, `actuel: ${MOTION_SNAP_FLIP_CONSECUTIVE}`);
+  check('MOTION_SNAP_FLIP_MIN_RPM = 19 (un vrai flip repart à ±20-33 RPM)', MOTION_SNAP_FLIP_MIN_RPM === 19, `actuel: ${MOTION_SNAP_FLIP_MIN_RPM}`);
+  check('MOTION_SNAP_RESNAP_RPM = 16 (> wobble max ~15,5, < retour de geste)', MOTION_SNAP_RESNAP_RPM === 16, `actuel: ${MOTION_SNAP_RESNAP_RPM}`);
+  check('MOTION_SNAP_RESNAP_CONSECUTIVE = 2 (re-snap rapide en mode geste)', MOTION_SNAP_RESNAP_CONSECUTIVE === 2, `actuel: ${MOTION_SNAP_RESNAP_CONSECUTIVE}`);
   check('STOPPED_MS = 120 (flip de scratch < 120 ms, arrêt réel > 120 ms)', STOPPED_MS === 120, `actuel: ${STOPPED_MS}`);
+  check('SLOW_STOP_MS = 200 (creux transitoire < 200 ms, freinage réel > 200 ms)', SLOW_STOP_MS === 200, `actuel: ${SLOW_STOP_MS}`);
   check('SLOW_STOP_GAP_RPM = 20 (> wobble max ~15,5, < décélération réelle)', SLOW_STOP_GAP_RPM === 20, `actuel: ${SLOW_STOP_GAP_RPM}`);
 
   // Le snap d'arrêt anticipé se base sur l'écart (estimé - brut) : sur le wobble
@@ -562,6 +572,119 @@ try {
     check('poussée franche 33->60 : écart 27 > 20 (snap)', 27 > MOTION_SNAP_RPM);
     // pitch léger 33 -> 36 : écart 3 < 20 -> la fenêtre suit (pas de snap)
     check('pitch léger 33->36 : écart 3 < 20 (pas de snap)', 3 < MOTION_SNAP_RPM);
+  }
+
+  // --- 7c. LE BUG "PICS DE RALENTISSEMENT" : les creux transitoires du wobble ---
+  // L'utilisateur : "c'est pas stable, ça envoie des piques de vitesse de
+  // ralentissement". Un creux du wobble (le brut plonge brièvement à ~8 RPM)
+  // franchissait MOTION_SNAP_RPM en 2 échantillons = 20 ms seulement, et
+  // l'ancien snap collait la sortie à la valeur du creux pendant ~0,5 s ->
+  // pic de ralentissement envoyé au Pi. Ce test reproduit la logique EXACTE
+  // du hook (persistance pour déviation même-signe, snap immédiat pour les
+  // flips, re-snap en fenêtre rapide) et vérifie que les creux ne déclenchent
+  // RIEN alors qu'un vrai geste suit toujours la main.
+  console.log('\n[7c] Pics de ralentissement : creux transitoire vs vrai geste');
+  {
+    // Reproduit le bloc MOTION SNAP du hook à l'identique
+    const snapMachine = () => {
+      let count = 0;
+      let fastWindowUntil = 0;
+      let est = 33.33; // estimé (la fenêtre 5 s bouge peu sur un creux court)
+      let snapped = [];
+      const DT = 10;
+      return {
+        // renvoie { snap: bool, valeur } et enregistre les snaps
+        step(rawSigned, now) {
+          const inFast = fastWindowUntil > now;
+          const flip = (rawSigned < 0) !== (est < 0) && Math.abs(rawSigned) > MOTION_SNAP_FLIP_MIN_RPM;
+          const threshold = inFast ? MOTION_SNAP_RESNAP_RPM : MOTION_SNAP_RPM;
+          const need = inFast
+            ? MOTION_SNAP_RESNAP_CONSECUTIVE
+            : flip
+              ? MOTION_SNAP_FLIP_CONSECUTIVE
+              : MOTION_SNAP_CONSECUTIVE;
+          const dev = Math.abs(rawSigned - est);
+          if (dev > threshold) {
+            count += 1;
+            if (count >= need) {
+              count = 0;
+              est = rawSigned; // snapTo
+              fastWindowUntil = now + 700;
+              snapped.push({ t: now, v: rawSigned, flip, inFast });
+              return { snap: true, v: est };
+            }
+          } else {
+            count = 0;
+          }
+          return { snap: false, v: est };
+        },
+        get snapped() {
+          return snapped;
+        },
+      };
+    };
+
+    // a) CREUX TRANSITOIRE (le bug) : 6 échantillons à ~8 RPM (60 ms) puis
+    //    retour à 33. L'ancien snap (2 éch.) se déclenchait -> pic. Le nouveau
+    //    (persistance 120 ms) ne doit RIEN déclencher : aucun snap enregistré.
+    {
+      const m = snapMachine();
+      for (let i = 0; i < 50; i++) m.step(33.3, i * 10); // rotation stable
+      for (let i = 0; i < 6; i++) m.step(8.0, (50 + i) * 10); // creux de 60 ms
+      for (let i = 0; i < 20; i++) m.step(33.3, (56 + i) * 10); // retour à 33
+      check('creux 60 ms : AUCUN snap (pas de pic de ralentissement)', m.snapped.length === 0, `${m.snapped.length} snaps`);
+      // la sortie doit être restée à ~33.3 tout du long
+      check('creux 60 ms : sortie figée à ~33.3', m.snapped.length === 0);
+    }
+    // b) CREUX LONG (100 ms, pire cas du wobble) : toujours sous les 120 ms
+    {
+      const m = snapMachine();
+      for (let i = 0; i < 50; i++) m.step(33.3, i * 10);
+      for (let i = 0; i < 10; i++) m.step(8.0, (50 + i) * 10); // creux de 100 ms
+      for (let i = 0; i < 20; i++) m.step(33.3, (60 + i) * 10);
+      check('creux 100 ms : AUCUN snap', m.snapped.length === 0, `${m.snapped.length} snaps`);
+    }
+    // c) FLIP (vrai scratch/backspin) : le brut passe au signe opposé avec une
+    //    magnitude ~33 -> snap IMMÉDIAT en 2 échantillons
+    {
+      const m = snapMachine();
+      for (let i = 0; i < 50; i++) m.step(33.3, i * 10);
+      for (let i = 0; i < 2; i++) m.step(-33.3, (50 + i) * 10); // flip soutenu
+      check('flip : snap immédiat en 2 éch. (~20 ms)', m.snapped.length === 1, `${m.snapped.length} snaps`);
+      check('flip : snapé à la vitesse négative (-33)', m.snapped.length === 1 && m.snapped[0].v === -33.3, JSON.stringify(m.snapped));
+    }
+    // c2) CREUX QUI FRANCHIT ZÉRO (le cas sournois) : le dot passe brièvement
+    //     à -8 (axe mal calibré / rocking violent) mais de petite magnitude.
+    //     Ce n'est PAS un vrai flip -> aucun snap, surtout PAS un pic négatif.
+    {
+      const m = snapMachine();
+      for (let i = 0; i < 50; i++) m.step(33.3, i * 10);
+      for (let i = 0; i < 6; i++) m.step(-8.0, (50 + i) * 10); // creux négatif 60 ms
+      for (let i = 0; i < 20; i++) m.step(33.3, (56 + i) * 10);
+      check('creux franchissant zéro (-8) : AUCUN snap (pas de pic négatif)', m.snapped.length === 0, `${m.snapped.length} snaps`);
+    }
+    // d) RETOUR DE GESTE (la main relâche : -33 -> +33) : en fenêtre rapide,
+    //    le re-snap à seuil réduit (14) rattrape immédiatement au lieu de
+    //    laisser la sortie basse
+    {
+      const m = snapMachine();
+      for (let i = 0; i < 50; i++) m.step(33.3, i * 10);
+      m.step(-33.3, 500); m.step(-33.3, 510); // flip -> snap, fenêtre rapide armée
+      const first = m.snapped.length;
+      // le brut repart à +20 (la main relâche) : déviation vs est(-33) = 53 > 16
+      // -> re-snap immédiat (2 éch.)
+      for (let i = 0; i < 2; i++) m.step(20.0, 520 + i * 10);
+      check('retour de geste : re-snap immédiat (seuil réduit)', m.snapped.length >= first + 1, `${m.snapped.length} snaps (avant: ${first})`);
+    }
+    // e) GESTE MÊME-SIGNE SOUTENU (poussée 33 -> 55, écart 22 > 20, tenue
+    //    150 ms) : un vrai geste même-signe franchit le seuil et déclenche la
+    //    PERSISTANCE (12 éch. = 120 ms) -> snap, pas de pic fantôme.
+    {
+      const m = snapMachine();
+      for (let i = 0; i < 50; i++) m.step(33.3, i * 10);
+      for (let i = 0; i < 15; i++) m.step(55.0, (50 + i) * 10); // poussée soutenue 150 ms
+      check('geste même-signe soutenu : snap après 120 ms', m.snapped.length === 1, `${m.snapped.length} snaps`);
+    }
   }
 
   // --- 8. Ré-accrochage STRICT après arrêt ---

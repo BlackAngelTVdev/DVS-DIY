@@ -21,6 +21,10 @@ import {
   relockStep,
   MOTION_SNAP_RPM,
   MOTION_SNAP_CONSECUTIVE,
+  MOTION_SNAP_FLIP_CONSECUTIVE,
+  MOTION_SNAP_FLIP_MIN_RPM,
+  MOTION_SNAP_RESNAP_RPM,
+  MOTION_SNAP_RESNAP_CONSECUTIVE,
   ESTIMATOR_WINDOW_MS,
   ESTIMATOR_FAST_WINDOW_MS,
   ESTIMATOR_FAST_HOLD_MS,
@@ -475,13 +479,41 @@ export function useRpmSensor() {
       // suivent donc tous les deux la main immédiatement.
       const rawRpmSigned = (dot >= 0 ? 1 : -1) * absSpeed * (60 / (2 * Math.PI));
       let rpmBrut = axialRpm;
-      if (!wasStoppedRef.current && Math.abs(rawRpmSigned - estRpm) > MOTION_SNAP_RPM) {
-        // 2 échantillons CONSÉCUTIFS requis (MOTION_SNAP_CONSECUTIVE) : une
-        // impulsion de bruit isolée qui dépasserait brièvement 20 RPM ne doit
-        // pas injecter le wobble dans la sortie lissée (faux snap -> saut au
-        // pic du wobble). Un geste réel dure des dizaines de ms -> toujours ok.
+      // MOTION SNAP : la magnitude suit la main pendant un VRAI geste, sans se
+      // laisser piéger par les creux transitoires du wobble (le bug "pics de
+      // ralentissement" : un creux de 60-120 ms déclenchait l'ancien snap en
+      // 20 ms et collait la sortie à une valeur basse pendant ~0,5 s).
+      // Trois cas :
+      //  - FLIP (le brut a changé de signe : scratch/backspin réel) -> snap en
+      //    2 éch. La main traverse le zéro, aucun creux de wobble ne fait ça.
+      //  - Déviation MÊME-SIGNE -> PERSISTANCE 120 ms requise (un vrai geste
+      //    dure des centaines de ms, un creux transitoire 60-120 ms).
+      //  - Déjà en fenêtre RAPIDE (mode geste) -> re-snap à seuil réduit en 2
+      //    éch : les flips successifs du scratch et le retour à 33 à la
+      //    relâche de la main sont suivis immédiatement.
+      const inFastWindowNow = fastWindowUntilRef.current > now;
+      // GARDE DE MAGNITUDE (tous les chemins) : un snap n'a de sens que si le
+      // brut est une vitesse SIGNIFICATIVE (> ~19 RPM). Les creux du wobble
+      // (même-signe, ou franchissant brièvement zéro si l'axe est mal calibré)
+      // restent TOUJOURS de petite magnitude (< 19) -> ils ne déclenchent
+      // jamais de snap, donc aucun pic (surtout pas négatif) envoyé. Un vrai
+      // geste (scratch, backspin, poussée) repart à ±20-33 RPM.
+      const snapMagnitude = Math.abs(rawRpmSigned) > MOTION_SNAP_FLIP_MIN_RPM;
+      const snapFlip =
+        (rawRpmSigned < 0) !== (estRpm < 0) && snapMagnitude;
+      const snapThreshold = inFastWindowNow ? MOTION_SNAP_RESNAP_RPM : MOTION_SNAP_RPM;
+      const snapNeed = inFastWindowNow
+        ? MOTION_SNAP_RESNAP_CONSECUTIVE
+        : snapFlip
+          ? MOTION_SNAP_FLIP_CONSECUTIVE
+          : MOTION_SNAP_CONSECUTIVE;
+      if (
+        !wasStoppedRef.current &&
+        snapMagnitude &&
+        Math.abs(rawRpmSigned - estRpm) > snapThreshold
+      ) {
         motionSnapCountRef.current += 1;
-        if (motionSnapCountRef.current >= MOTION_SNAP_CONSECUTIVE) {
+        if (motionSnapCountRef.current >= snapNeed) {
           motionSnapCountRef.current = 0;
           const fastSigned =
             (fastSpeedTrackerRef.current ?? absSpeed) * (60 / (2 * Math.PI)) * (dot >= 0 ? 1 : -1);
